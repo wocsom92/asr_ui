@@ -298,6 +298,8 @@ async def transcribe_audio(
         str(wav_path),
         "-t",
         str(settings.whisper_threads),
+        "-mc",
+        str(settings.whisper_max_context),
         "-otxt",
         "-osrt",
         "-ovtt",

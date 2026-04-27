@@ -19,6 +19,7 @@ class Settings(BaseSettings):
 
     whisper_cpp_bin: str = "/opt/whisper.cpp/build/bin/whisper-cli"
     whisper_threads: int = 4
+    whisper_max_context: int = 0
     # whisper.cpp defaults to GPU + flash attention; both can crash or mis-allocate in
     # common Docker/CPU-only setups (e.g. std::length_error on model init). Opt in explicitly.
     whisper_use_gpu: bool = False

@@ -38,6 +38,7 @@ Useful settings:
 - `FRONTEND_PORT` and `BACKEND_PORT`: published Docker Compose ports.
 - `MAX_UPLOAD_MB`: upload size limit.
 - `WHISPER_THREADS`: number of CPU threads passed to whisper.cpp.
+- `WHISPER_MAX_CONTEXT`: max previous text tokens passed between windows. The default `0` prevents hallucinations from repeating through a long file.
 - `WHISPER_USE_GPU` and `WHISPER_FLASH_ATTN`: disabled by default for CPU-only Docker reliability.
 - `TRANSCRIPT_FILTER_REGEX`: optional regex removed from generated transcript text. Leave it empty to disable cleanup.
 
