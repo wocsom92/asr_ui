@@ -202,3 +202,155 @@ def test_transcription_delete_is_owner_scoped_and_removes_outputs(monkeypatch):
             assert not srt_path.exists()
             assert not vtt_path.exists()
             assert not output_dir.exists()
+
+
+def test_projects_group_files_and_related_transcriptions(monkeypatch):
+    monkeypatch.setattr(files_router, "probe_duration_seconds", fake_probe_duration)
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        created = client.post(
+            "/api/v1/projects",
+            json={"name": "Interviews", "description": "Candidate calls"},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        duplicate = client.post(
+            "/api/v1/projects",
+            json={"name": " interviews "},
+        )
+        assert duplicate.status_code == 400
+
+        upload = client.post(
+            "/api/v1/files",
+            data={"project_id": str(project_id)},
+            files={"upload": ("candidate.m4a", b"fake-audio", "audio/mp4")},
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["id"]
+        assert upload.json()["project_id"] == project_id
+        assert upload.json()["project"]["name"] == "Interviews"
+
+        all_files = client.get("/api/v1/files")
+        assert [item["id"] for item in all_files.json()] == [file_id]
+        project_files = client.get(f"/api/v1/files?project_id={project_id}")
+        assert [item["id"] for item in project_files.json()] == [file_id]
+        unassigned_files = client.get("/api/v1/files?project_id=none")
+        assert unassigned_files.json() == []
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'tiny-projects', 'Tiny Projects', 'multilingual', '/models/tiny.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text, transcript_text)
+            values (?, ?, ?, 'ru', 'succeeded', 'Done', 'hello')
+            returning id
+            """,
+            (admin_id, file_id, model_id),
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        transcriptions = client.get(f"/api/v1/transcriptions?project_id={project_id}")
+        assert transcriptions.status_code == 200
+        assert [item["id"] for item in transcriptions.json()] == [job_id]
+        assert transcriptions.json()[0]["audio_file"]["project"]["name"] == "Interviews"
+
+        unassigned_transcriptions = client.get("/api/v1/transcriptions?project_id=none")
+        assert unassigned_transcriptions.status_code == 200
+        assert unassigned_transcriptions.json() == []
+
+        update = client.patch(f"/api/v1/files/{file_id}", json={"project_id": None})
+        assert update.status_code == 200
+        assert update.json()["project_id"] is None
+        assert update.json()["project"] is None
+
+        unassigned_transcriptions = client.get("/api/v1/transcriptions?project_id=none")
+        assert [item["id"] for item in unassigned_transcriptions.json()] == [job_id]
+
+        update = client.patch(f"/api/v1/files/{file_id}", json={"project_id": project_id})
+        assert update.status_code == 200
+        delete = client.delete(f"/api/v1/projects/{project_id}")
+        assert delete.status_code == 200
+        after_delete = client.get("/api/v1/files?project_id=none")
+        assert [item["id"] for item in after_delete.json()] == [file_id]
+        after_delete_transcriptions = client.get("/api/v1/transcriptions?project_id=none")
+        assert [item["id"] for item in after_delete_transcriptions.json()] == [job_id]
+
+
+def test_project_assignment_is_owner_scoped(monkeypatch):
+    monkeypatch.setattr(files_router, "probe_duration_seconds", fake_probe_duration)
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+
+        created = client.post(
+            "/api/v1/users/",
+            json={
+                "username": "charlie",
+                "email": "charlie@example.com",
+                "password": "password1",
+                "role": "user",
+            },
+        )
+        assert created.status_code == 200
+
+        admin_project = client.post("/api/v1/projects", json={"name": "Admin project"})
+        assert admin_project.status_code == 200
+        admin_project_id = admin_project.json()["id"]
+
+        charlie = TestClient(app)
+        with charlie:
+            login = charlie.post(
+                "/api/v1/auth/login",
+                json={"username": "charlie", "password": "password1"},
+            )
+            assert login.status_code == 200
+
+            upload = charlie.post(
+                "/api/v1/files",
+                data={"project_id": str(admin_project_id)},
+                files={"upload": ("private.m4a", b"fake-audio", "audio/mp4")},
+            )
+            assert upload.status_code == 404
+
+            own_project = charlie.post("/api/v1/projects", json={"name": "Own project"})
+            assert own_project.status_code == 200
+            own_project_id = own_project.json()["id"]
+
+            upload = charlie.post(
+                "/api/v1/files",
+                files={"upload": ("private.m4a", b"fake-audio", "audio/mp4")},
+            )
+            assert upload.status_code == 200
+            file_id = upload.json()["id"]
+
+            forbidden_update = client.patch(
+                f"/api/v1/files/{file_id}",
+                json={"project_id": admin_project_id},
+            )
+            assert forbidden_update.status_code == 404
+
+            update = charlie.patch(
+                f"/api/v1/files/{file_id}",
+                json={"project_id": own_project_id},
+            )
+            assert update.status_code == 200
+            assert update.json()["project_id"] == own_project_id

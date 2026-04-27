@@ -62,6 +62,7 @@ async def init_db():
         for column, col_type in (
             ("display_name", "VARCHAR(255)"),
             ("notes", "TEXT"),
+            ("project_id", "INTEGER"),
         ):
             try:
                 await conn.execute(

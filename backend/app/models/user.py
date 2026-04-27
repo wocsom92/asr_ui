@@ -21,6 +21,9 @@ class User(Base):
     audio_files: Mapped[list["AudioFile"]] = relationship(  # noqa: F821
         back_populates="owner", cascade="all, delete-orphan"
     )
+    projects: Mapped[list["Project"]] = relationship(  # noqa: F821
+        back_populates="owner", cascade="all, delete-orphan"
+    )
     transcription_jobs: Mapped[list["TranscriptionJob"]] = relationship(  # noqa: F821
         back_populates="owner", cascade="all, delete-orphan"
     )

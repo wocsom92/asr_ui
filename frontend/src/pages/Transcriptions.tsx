@@ -9,12 +9,13 @@ import { PaginationControls } from "@/components/PaginationControls"
 import { TranscriptAudioPlayer } from "@/components/TranscriptAudioPlayer"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { audioTitle } from "@/lib/audio"
 import { formatDateTimeLocal } from "@/lib/datetime"
 import { formatBytes, formatDuration } from "@/lib/format"
 import { jobRuntime, MetadataItem } from "@/lib/jobs"
-import type { TranscriptionJob } from "@/types"
+import type { Project, TranscriptionJob } from "@/types"
 
 const PAGE_SIZE = 20
 
@@ -30,11 +31,24 @@ export default function Transcriptions() {
   const [searchParams] = useSearchParams()
   const [expandedId, setExpandedId] = useState<number | null>(null)
   const [page, setPage] = useState(1)
+  const [projectFilter, setProjectFilter] = useState("all")
+  const projectParams =
+    projectFilter === "all" ? undefined : { project_id: projectFilter }
   const { data: jobs = [], isLoading } = useQuery<TranscriptionJob[]>({
-    queryKey: ["transcriptions"],
-    queryFn: () => api.get("/transcriptions").then((r) => r.data),
+    queryKey: ["transcriptions", projectFilter],
+    queryFn: () => api.get("/transcriptions", { params: projectParams }).then((r) => r.data),
     refetchInterval: 5000,
   })
+  const { data: projects = [], isLoading: projectsLoading } = useQuery<Project[]>({
+    queryKey: ["projects"],
+    queryFn: () => api.get("/projects").then((r) => r.data),
+  })
+  useEffect(() => {
+    if (projectsLoading || projectFilter === "all" || projectFilter === "none") return
+    if (!projects.some((project) => String(project.id) === projectFilter)) {
+      setProjectFilter("all")
+    }
+  }, [projectFilter, projects, projectsLoading])
 
   const finishedJobs = useMemo(
     () => jobs.filter((job) => job.status === "succeeded"),
@@ -82,9 +96,25 @@ export default function Transcriptions() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">Transcriptions</h1>
-        <p className="text-muted-foreground">Finished transcripts, text viewer, and downloads.</p>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Transcriptions</h1>
+          <p className="text-muted-foreground">Finished transcripts, text viewer, and downloads.</p>
+        </div>
+        <Select value={projectFilter} onValueChange={setProjectFilter}>
+          <SelectTrigger className="w-full sm:w-48">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All projects</SelectItem>
+            <SelectItem value="none">Unassigned</SelectItem>
+            {projects.map((project) => (
+              <SelectItem key={project.id} value={String(project.id)}>
+                {project.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
       {isLoading ? (
@@ -127,6 +157,9 @@ export default function Transcriptions() {
                       <p className="truncate text-sm font-medium">{audioTitle(job.audio_file, `Job #${job.id}`)}</p>
                       <p className="mt-1 truncate text-xs text-muted-foreground">
                         {job.model?.display_name ?? job.model?.variant ?? "model"} · {job.language}
+                      </p>
+                      <p className="mt-1 truncate text-xs text-muted-foreground">
+                        Project: {job.audio_file?.project?.name ?? "Unassigned"}
                       </p>
                       <p className="mt-1 truncate text-xs text-muted-foreground">
                         Finished {job.finished_at ? formatDateTimeLocal(job.finished_at) : formatDateTimeLocal(job.created_at)} · Runtime {jobRuntime(job)}
@@ -173,6 +206,7 @@ export default function Transcriptions() {
                       <MetadataItem label="Finished" value={job.finished_at ? formatDateTimeLocal(job.finished_at) : "Unknown"} />
                       <MetadataItem label="Model" value={job.model?.variant ?? "Unknown"} />
                       <MetadataItem label="Language" value={job.language} />
+                      <MetadataItem label="Project" value={job.audio_file?.project?.name ?? "Unassigned"} />
                       <MetadataItem
                         label="Transcript Files"
                         value={

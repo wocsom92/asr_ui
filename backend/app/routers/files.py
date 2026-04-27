@@ -1,7 +1,7 @@
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +11,7 @@ from app.auth.deps import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models.audio_file import AudioFile
+from app.models.project import Project
 from app.models.transcription_job import TranscriptionJob
 from app.models.transcription_model import TranscriptionModel
 from app.models.user import User
@@ -35,15 +36,47 @@ def _iter_file_range(path: Path, start: int, end: int):
             yield chunk
 
 
+async def _validate_project_id(
+    db: AsyncSession,
+    user_id: int,
+    project_id: int | None,
+) -> int | None:
+    if project_id is None:
+        return None
+    result = await db.execute(
+        select(Project.id).where(Project.id == project_id, Project.owner_user_id == user_id)
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project_id
+
+
+def _apply_project_filter(query, project_id: str | None):
+    if project_id is None:
+        return query
+    if project_id == "none":
+        return query.where(AudioFile.project_id.is_(None))
+    try:
+        parsed_project_id = int(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid project filter") from exc
+    return query.where(AudioFile.project_id == parsed_project_id)
+
+
 @router.get("", response_model=list[AudioFileOut])
 async def list_files(
+    project_id: str | None = Query(default=None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
+    query = (
         select(AudioFile)
+        .options(selectinload(AudioFile.project))
         .where(AudioFile.owner_user_id == user.id)
-        .order_by(AudioFile.created_at.desc(), AudioFile.id.desc())
+    )
+    query = _apply_project_filter(query, project_id)
+    result = await db.execute(
+        query.order_by(AudioFile.created_at.desc(), AudioFile.id.desc())
     )
     return result.scalars().all()
 
@@ -51,6 +84,7 @@ async def list_files(
 @router.post("", response_model=AudioFileOut)
 async def upload_file(
     upload: UploadFile = File(...),
+    project_id: int | None = Form(default=None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -73,9 +107,11 @@ async def upload_file(
                 raise HTTPException(status_code=413, detail="Audio file is too large")
             handle.write(chunk)
 
+    validated_project_id = await _validate_project_id(db, user.id, project_id)
     duration = await probe_duration_seconds(stored_path)
     audio = AudioFile(
         owner_user_id=user.id,
+        project_id=validated_project_id,
         original_filename=filename,
         display_name=filename,
         stored_path=str(stored_path),
@@ -86,6 +122,7 @@ async def upload_file(
     db.add(audio)
     await db.commit()
     await db.refresh(audio)
+    await db.refresh(audio, attribute_names=["project"])
     return audio
 
 
@@ -111,9 +148,12 @@ async def update_file(
     if body.notes is not None:
         notes = body.notes.strip()
         audio.notes = notes or None
+    if "project_id" in body.model_fields_set:
+        audio.project_id = await _validate_project_id(db, user.id, body.project_id)
 
     await db.commit()
     await db.refresh(audio)
+    await db.refresh(audio, attribute_names=["project"])
     return audio
 
 
@@ -225,7 +265,9 @@ async def create_transcription(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     audio_result = await db.execute(
-        select(AudioFile).where(AudioFile.id == file_id, AudioFile.owner_user_id == user.id)
+        select(AudioFile)
+        .options(selectinload(AudioFile.project))
+        .where(AudioFile.id == file_id, AudioFile.owner_user_id == user.id)
     )
     audio = audio_result.scalar_one_or_none()
     if not audio:
@@ -265,6 +307,7 @@ async def create_transcription(
         select(TranscriptionJob)
         .options(
             selectinload(TranscriptionJob.audio_file),
+            selectinload(TranscriptionJob.audio_file).selectinload(AudioFile.project),
             selectinload(TranscriptionJob.model),
         )
         .where(TranscriptionJob.id == job.id)

@@ -14,6 +14,7 @@ class AudioFile(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     owner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    project_id: Mapped[Optional[int]] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
     original_filename: Mapped[str] = mapped_column(String(255))
     display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -24,6 +25,7 @@ class AudioFile(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     owner: Mapped["User"] = relationship(back_populates="audio_files")  # noqa: F821
+    project: Mapped[Optional["Project"]] = relationship(back_populates="audio_files")  # noqa: F821
     transcription_jobs: Mapped[list["TranscriptionJob"]] = relationship(  # noqa: F821
         back_populates="audio_file", cascade="all, delete-orphan"
     )

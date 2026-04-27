@@ -5,9 +5,13 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas.project import ProjectOut
+
 
 class AudioFileOut(BaseModel):
     id: int
+    project_id: Optional[int]
+    project: Optional[ProjectOut] = None
     original_filename: str
     display_name: Optional[str]
     notes: Optional[str]
@@ -22,3 +26,4 @@ class AudioFileOut(BaseModel):
 class AudioFileUpdate(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=255)
     notes: Optional[str] = Field(default=None, max_length=10000)
+    project_id: Optional[int] = None

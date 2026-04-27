@@ -6,8 +6,18 @@ export interface User {
   created_at: string
 }
 
+export interface Project {
+  id: number
+  name: string
+  description: string | null
+  created_at: string
+  updated_at: string | null
+}
+
 export interface AudioFile {
   id: number
+  project_id: number | null
+  project: Project | null
   original_filename: string
   display_name: string | null
   notes: string | null

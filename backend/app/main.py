@@ -32,11 +32,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.routers import auth, files, models, system, transcriptions, users  # noqa: E402
+from app.routers import auth, files, models, projects, system, transcriptions, users  # noqa: E402
 
 app.include_router(auth.router)
 app.include_router(system.router)
 app.include_router(files.router)
 app.include_router(transcriptions.router)
 app.include_router(models.router)
+app.include_router(projects.router)
 app.include_router(users.router)

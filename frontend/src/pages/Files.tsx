@@ -1,10 +1,10 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { FileAudio, Loader2, Pencil, Play, Trash2, Upload } from "lucide-react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
 import api from "@/api/client"
-import type { AudioFile, TranscriptionJob, TranscriptionModel } from "@/types"
+import type { AudioFile, Project, TranscriptionJob, TranscriptionModel } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -58,6 +58,8 @@ export default function Files() {
   const [editingFile, setEditingFile] = useState<AudioFile | null>(null)
   const [editName, setEditName] = useState("")
   const [editNotes, setEditNotes] = useState("")
+  const [editProjectId, setEditProjectId] = useState("none")
+  const [projectFilter, setProjectFilter] = useState("all")
   const [modelId, setModelId] = useState("")
   const [language, setLanguage] = useState("auto")
   const [uploadProgress, setUploadProgress] = useState<{
@@ -67,15 +69,27 @@ export default function Files() {
     phase: "uploading" | "processing"
   } | null>(null)
 
+  const projectParams =
+    projectFilter === "all" ? undefined : { project_id: projectFilter }
   const { data: files = [], isLoading } = useQuery<AudioFile[]>({
-    queryKey: ["files"],
-    queryFn: () => api.get("/files").then((r) => r.data),
+    queryKey: ["files", projectFilter],
+    queryFn: () => api.get("/files", { params: projectParams }).then((r) => r.data),
   })
   const { data: jobs = [] } = useQuery<TranscriptionJob[]>({
-    queryKey: ["transcriptions"],
-    queryFn: () => api.get("/transcriptions").then((r) => r.data),
+    queryKey: ["transcriptions", projectFilter],
+    queryFn: () => api.get("/transcriptions", { params: projectParams }).then((r) => r.data),
     refetchInterval: 5000,
   })
+  const { data: projects = [], isLoading: projectsLoading } = useQuery<Project[]>({
+    queryKey: ["projects"],
+    queryFn: () => api.get("/projects").then((r) => r.data),
+  })
+  useEffect(() => {
+    if (projectsLoading || projectFilter === "all" || projectFilter === "none") return
+    if (!projects.some((project) => String(project.id) === projectFilter)) {
+      setProjectFilter("all")
+    }
+  }, [projectFilter, projects, projectsLoading])
   const { data: allModels = [] } = useQuery<TranscriptionModel[]>({
     queryKey: ["models", "usable"],
     queryFn: () => api.get("/models").then((r) => r.data),
@@ -105,6 +119,9 @@ export default function Files() {
     mutationFn: async (file: File) => {
       const form = new FormData()
       form.append("upload", file)
+      if (projectFilter !== "all" && projectFilter !== "none") {
+        form.append("project_id", projectFilter)
+      }
       setUploadProgress({
         filename: file.name,
         loaded: 0,
@@ -152,6 +169,7 @@ export default function Files() {
       api.patch(`/files/${editingFile?.id}`, {
         display_name: editName,
         notes: editNotes,
+        project_id: editProjectId === "none" ? null : Number(editProjectId),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["files"] })
@@ -197,7 +215,14 @@ export default function Files() {
     setEditingFile(file)
     setEditName(file.display_name || file.original_filename)
     setEditNotes(file.notes || "")
+    setEditProjectId(file.project_id ? String(file.project_id) : "none")
   }
+
+  const ProjectBadge = ({ file }: { file: AudioFile }) => (
+    <Badge variant={file.project ? "secondary" : "outline"} className="mt-2">
+      {file.project?.name ?? "Unassigned"}
+    </Badge>
+  )
 
   const handleModelChange = (value: string) => {
     setModelId(value)
@@ -235,20 +260,36 @@ export default function Files() {
           <h1 className="text-3xl font-bold tracking-tight">Audio Files</h1>
           <p className="text-muted-foreground">Upload iPhone recordings and other audio files.</p>
         </div>
-        <Label className="inline-flex cursor-pointer items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
-          {uploadMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
-          Upload Audio
-          <Input
-            type="file"
-            accept="audio/*,.m4a,.aac,.mp4,.mov,.wav,.mp3,.flac,.ogg,.webm"
-            className="hidden"
-            onChange={(event) => {
-              const file = event.target.files?.[0]
-              if (file) uploadMutation.mutate(file)
-              event.currentTarget.value = ""
-            }}
-          />
-        </Label>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Select value={projectFilter} onValueChange={setProjectFilter}>
+            <SelectTrigger className="w-full sm:w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All projects</SelectItem>
+              <SelectItem value="none">Unassigned</SelectItem>
+              {projects.map((project) => (
+                <SelectItem key={project.id} value={String(project.id)}>
+                  {project.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Label className="inline-flex cursor-pointer items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
+            {uploadMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+            Upload Audio
+            <Input
+              type="file"
+              accept="audio/*,.m4a,.aac,.mp4,.mov,.wav,.mp3,.flac,.ogg,.webm"
+              className="hidden"
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                if (file) uploadMutation.mutate(file)
+                event.currentTarget.value = ""
+              }}
+            />
+          </Label>
+        </div>
       </div>
 
       {uploadProgress && (
@@ -333,6 +374,7 @@ export default function Files() {
                       <p className="truncate font-medium">{file.display_name || file.original_filename}</p>
                       <p className="truncate text-xs text-muted-foreground">{file.original_filename}</p>
                       {file.notes && <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{file.notes}</p>}
+                      <ProjectBadge file={file} />
                       <TranscriptionLabels file={file} />
                     </td>
                     <td className="w-[280px] p-3">
@@ -372,6 +414,9 @@ export default function Files() {
                   <div className="flex flex-wrap gap-2">
                     <Badge variant="secondary">{formatDuration(file.duration_seconds)}</Badge>
                     <Badge variant="outline">{formatBytes(file.size_bytes)}</Badge>
+                    <Badge variant={file.project ? "secondary" : "outline"}>
+                      {file.project?.name ?? "Unassigned"}
+                    </Badge>
                   </div>
                   <TranscriptionLabels file={file} />
                   <AudioPreview file={file} />
@@ -489,6 +534,22 @@ export default function Files() {
                 onChange={(event) => setEditNotes(event.target.value)}
                 placeholder="Add context, speakers, source, or anything useful for this recording."
               />
+            </div>
+            <div className="space-y-2">
+              <Label>Project</Label>
+              <Select value={editProjectId} onValueChange={setEditProjectId}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Unassigned</SelectItem>
+                  {projects.map((project) => (
+                    <SelectItem key={project.id} value={String(project.id)}>
+                      {project.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <DialogFooter>
               <Button type="submit" disabled={updateMutation.isPending}>

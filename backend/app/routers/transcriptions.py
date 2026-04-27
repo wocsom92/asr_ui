@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth.deps import get_current_user
 from app.database import get_db
+from app.models.audio_file import AudioFile
 from app.models.transcription_job import TranscriptionJob
 from app.models.user import User
 from app.schemas.transcription import TranscriptionJobOut, TranscriptionSegmentOut
@@ -93,19 +94,35 @@ def _job_query(user_id: int):
         select(TranscriptionJob)
         .options(
             selectinload(TranscriptionJob.audio_file),
+            selectinload(TranscriptionJob.audio_file).selectinload(AudioFile.project),
             selectinload(TranscriptionJob.model),
         )
         .where(TranscriptionJob.owner_user_id == user_id)
     )
 
 
+def _apply_project_filter(query, project_id: str | None):
+    if project_id is None:
+        return query
+    query = query.join(TranscriptionJob.audio_file)
+    if project_id == "none":
+        return query.where(AudioFile.project_id.is_(None))
+    try:
+        parsed_project_id = int(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid project filter") from exc
+    return query.where(AudioFile.project_id == parsed_project_id)
+
+
 @router.get("", response_model=list[TranscriptionJobOut])
 async def list_transcriptions(
+    project_id: str | None = Query(default=None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    query = _apply_project_filter(_job_query(user.id), project_id)
     result = await db.execute(
-        _job_query(user.id).order_by(
+        query.order_by(
             TranscriptionJob.created_at.desc(), TranscriptionJob.id.desc()
         )
     )
@@ -179,6 +196,7 @@ async def cancel_transcription(
         select(TranscriptionJob)
         .options(
             selectinload(TranscriptionJob.audio_file),
+            selectinload(TranscriptionJob.audio_file).selectinload(AudioFile.project),
             selectinload(TranscriptionJob.model),
         )
         .where(TranscriptionJob.id == job_id, TranscriptionJob.owner_user_id == user.id)
