@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Loader2, Pencil, Plus, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import api from "@/api/client"
-import type { User } from "@/types"
+import type { User, UserStats } from "@/types"
 import { useAuthStore } from "@/stores/auth"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -41,6 +41,11 @@ export default function UserManagement() {
     queryFn: () => api.get("/users/").then((r) => r.data),
     enabled: currentUser?.role === "admin",
   })
+  const { data: stats = [], isLoading: statsLoading } = useQuery<UserStats[]>({
+    queryKey: ["users", "stats"],
+    queryFn: () => api.get("/users/stats").then((r) => r.data),
+    enabled: currentUser?.role === "admin",
+  })
 
   const closeDialog = () => setOpen(false)
   const openCreate = () => {
@@ -71,6 +76,7 @@ export default function UserManagement() {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] })
+      qc.invalidateQueries({ queryKey: ["users", "stats"] })
       closeDialog()
       toast.success("User saved")
     },
@@ -81,6 +87,7 @@ export default function UserManagement() {
     mutationFn: (id: number) => api.delete(`/users/${id}`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] })
+      qc.invalidateQueries({ queryKey: ["users", "stats"] })
       toast.success("User deleted")
     },
     onError: (err: any) => toast.error(err.response?.data?.detail || "Delete failed"),
@@ -168,6 +175,86 @@ export default function UserManagement() {
           </div>
         </>
       )}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>User Stats</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {statsLoading ? (
+            <div className="flex justify-center py-8">
+              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : (
+            <>
+              <div className="hidden overflow-hidden rounded-lg border md:block">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50">
+                    <tr>
+                      <th className="p-3 text-left font-medium">User</th>
+                      <th className="p-3 text-left font-medium">Audio files</th>
+                      <th className="p-3 text-left font-medium">Transcriptions</th>
+                      <th className="p-3 text-left font-medium">Running jobs</th>
+                      <th className="p-3 text-left font-medium">Input types</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {stats.map((item) => (
+                      <tr key={item.user_id}>
+                        <td className="p-3">
+                          <p className="font-medium">{item.username}</p>
+                          <p className="text-xs text-muted-foreground">{item.email}</p>
+                        </td>
+                        <td className="p-3 font-medium">{item.audio_file_count}</td>
+                        <td className="p-3 font-medium">{item.transcription_count}</td>
+                        <td className="p-3 font-medium">{item.running_job_count}</td>
+                        <td className="p-3">
+                          <div className="flex flex-wrap gap-2">
+                            <Badge variant="secondary">Web {item.web_audio_count}</Badge>
+                            <Badge variant="outline">Telegram {item.telegram_audio_count}</Badge>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="space-y-3 md:hidden">
+                {stats.map((item) => (
+                  <div key={item.user_id} className="rounded-md border p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="font-medium">{item.username}</p>
+                        <p className="text-xs text-muted-foreground">{item.email}</p>
+                      </div>
+                      <Badge>{item.role}</Badge>
+                    </div>
+                    <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
+                      <div>
+                        <p className="text-xs text-muted-foreground">Audio</p>
+                        <p className="font-medium">{item.audio_file_count}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Transcripts</p>
+                        <p className="font-medium">{item.transcription_count}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Running</p>
+                        <p className="font-medium">{item.running_job_count}</p>
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Badge variant="secondary">Web {item.web_audio_count}</Badge>
+                      <Badge variant="outline">Telegram {item.telegram_audio_count}</Badge>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>

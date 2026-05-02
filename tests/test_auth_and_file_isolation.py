@@ -1,6 +1,8 @@
+import json
 import os
 import shutil
 import sqlite3
+import asyncio
 from pathlib import Path
 
 TEST_ROOT = Path("/tmp/asr_ui_tests")
@@ -18,10 +20,25 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
 from app.routers import files as files_router  # noqa: E402
+from app.database import async_session_factory  # noqa: E402
+from app.services.transcriber import parse_whisper_segment_line  # noqa: E402
+from app.services.worker_runtime import try_merge_split_job  # noqa: E402
 
 
 async def fake_probe_duration(_path):
     return 12.5
+
+
+def test_live_whisper_segment_parser_extracts_segments():
+    parsed = parse_whisper_segment_line(
+        "[00:01:00.000 --> 00:01:29.980]  Hello world"
+    )
+    assert parsed == {
+        "timestamps": {"from": "00:01:00,000", "to": "00:01:29,980"},
+        "offsets": {"from": 60000, "to": 89980},
+        "text": "Hello world",
+    }
+    assert parse_whisper_segment_line("whisper_print_progress_callback: progress =  33%") is None
 
 
 def test_first_registration_creates_admin_and_closes_public_signup(monkeypatch):
@@ -204,6 +221,344 @@ def test_transcription_delete_is_owner_scoped_and_removes_outputs(monkeypatch):
             assert not output_dir.exists()
 
 
+def test_model_stats_are_admin_only_and_report_runtime_per_audio_hour():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        created = client.post(
+            "/api/v1/users/",
+            json={
+                "username": "modelstats_user",
+                "email": "modelstats@example.com",
+                "password": "password1",
+                "role": "user",
+            },
+        )
+        assert created.status_code == 200
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'stats-model', 'Stats Model', 'multilingual', '/models/stats.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'hour.wav', 'hour.wav', 'web', '/tmp/hour.wav', 10, 3600)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, started_at, finished_at)
+            values (?, ?, ?, 'en', 'succeeded', '2026-01-01 00:00:00', '2026-01-01 00:12:00')
+            """,
+            (admin_id, audio_id, model_id),
+        )
+        conn.commit()
+        conn.close()
+
+        stats = client.get("/api/v1/models/stats")
+        assert stats.status_code == 200
+        model_stats = next(item for item in stats.json() if item["model_id"] == model_id)
+        assert model_stats["completed_job_count"] == 1
+        assert model_stats["total_audio_seconds"] == 3600
+        assert model_stats["total_runtime_seconds"] == 720
+        assert model_stats["runtime_per_audio_hour_seconds"] == 720
+        assert model_stats["median_runtime_per_audio_hour_seconds"] == 720
+
+        non_admin = TestClient(app)
+        with non_admin:
+            login = non_admin.post(
+                "/api/v1/auth/login",
+                json={"username": "modelstats_user", "password": "password1"},
+            )
+            assert login.status_code == 200
+        forbidden = non_admin.get("/api/v1/models/stats")
+        assert forbidden.status_code == 403
+
+
+def test_split_chunks_use_exact_model_worker_speed(monkeypatch):
+    monkeypatch.setattr(files_router, "validate_transcription_runtime", lambda: None)
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'split-speed-model', 'Split Speed Model', 'multilingual', '/models/split-speed.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'split.wav', 'split.wav', 'web', '/tmp/split.wav', 10, 120)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        slow_worker_id = conn.execute(
+            """
+            insert into transcription_workers
+            (name, accepted, is_deleted, status, total_audio_seconds, total_runtime_seconds)
+            values ('slow-exact-model', 1, 0, 'idle', 1000, 100)
+            returning id
+            """
+        ).fetchone()[0]
+        fast_worker_id = conn.execute(
+            """
+            insert into transcription_workers
+            (name, accepted, is_deleted, status, total_audio_seconds, total_runtime_seconds)
+            values ('fast-exact-model', 1, 0, 'idle', 10, 100)
+            returning id
+            """
+        ).fetchone()[0]
+
+        history_audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'history.wav', 'history.wav', 'web', '/tmp/history.wav', 10, 100)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, worker_id, worker_name_snapshot, started_at, finished_at, split_enabled)
+            values (?, ?, ?, 'ru', 'succeeded', ?, 'slow-exact-model', '2026-01-01 00:00:00', '2026-01-01 00:03:20', 0)
+            """,
+            (admin_id, history_audio_id, model_id, slow_worker_id),
+        )
+        conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, worker_id, worker_name_snapshot, started_at, finished_at, split_enabled)
+            values (?, ?, ?, 'ru', 'succeeded', ?, 'fast-exact-model', '2026-01-01 00:00:00', '2026-01-01 00:00:20', 0)
+            """,
+            (admin_id, history_audio_id, model_id, fast_worker_id),
+        )
+        conn.commit()
+        conn.close()
+
+        response = client.post(
+            f"/api/v1/files/{audio_id}/transcriptions",
+            json={
+                "model_id": model_id,
+                "language": "ru",
+                "split_enabled": True,
+                "split_worker_ids": [slow_worker_id, fast_worker_id],
+            },
+        )
+        assert response.status_code == 200
+        chunks = sorted(response.json()["split_chunks"], key=lambda item: item["index"])
+        assert [chunk["worker_id"] for chunk in chunks] == [slow_worker_id, fast_worker_id]
+
+        slow_seconds = chunks[0]["end_seconds"] - chunks[0]["start_seconds"] - chunks[0]["overlap_end_seconds"]
+        fast_seconds = chunks[1]["end_seconds"] - chunks[1]["start_seconds"] - chunks[1]["overlap_start_seconds"]
+        assert fast_seconds > slow_seconds * 4
+
+
+def test_split_chunks_fallback_to_worker_speed_for_matching_model(monkeypatch):
+    monkeypatch.setattr(files_router, "validate_transcription_runtime", lambda: None)
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'base.ru', 'Whisper base Russian', 'russian', '/models/ggml-base.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'split-model-speed.wav', 'split-model-speed.wav', 'web', '/tmp/split-model-speed.wav', 10, 120)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        slow_stats = json.dumps(
+            [
+                {
+                    "variant": "base",
+                    "completed_count": 1,
+                    "total_runtime_seconds": 200,
+                    "total_audio_seconds": 100,
+                    "runtime_per_audio_hour_seconds": 7200,
+                },
+                {
+                    "variant": "small",
+                    "completed_count": 1,
+                    "total_runtime_seconds": 10,
+                    "total_audio_seconds": 100,
+                    "runtime_per_audio_hour_seconds": 360,
+                },
+            ]
+        )
+        fast_stats = json.dumps(
+            [
+                {
+                    "variant": "base",
+                    "completed_count": 1,
+                    "total_runtime_seconds": 20,
+                    "total_audio_seconds": 100,
+                    "runtime_per_audio_hour_seconds": 720,
+                },
+                {
+                    "variant": "small",
+                    "completed_count": 1,
+                    "total_runtime_seconds": 200,
+                    "total_audio_seconds": 100,
+                    "runtime_per_audio_hour_seconds": 7200,
+                },
+            ]
+        )
+        slow_worker_id = conn.execute(
+            """
+            insert into transcription_workers
+            (name, accepted, is_deleted, status, total_audio_seconds, total_runtime_seconds, model_speed_stats_json)
+            values ('slow-base-model', 1, 0, 'idle', 1000, 10, ?)
+            returning id
+            """,
+            (slow_stats,),
+        ).fetchone()[0]
+        fast_worker_id = conn.execute(
+            """
+            insert into transcription_workers
+            (name, accepted, is_deleted, status, total_audio_seconds, total_runtime_seconds, model_speed_stats_json)
+            values ('fast-base-model', 1, 0, 'idle', 10, 1000, ?)
+            returning id
+            """,
+            (fast_stats,),
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        response = client.post(
+            f"/api/v1/files/{audio_id}/transcriptions",
+            json={
+                "model_id": model_id,
+                "language": "ru",
+                "split_enabled": True,
+                "split_worker_ids": [slow_worker_id, fast_worker_id],
+            },
+        )
+        assert response.status_code == 200
+        chunks = sorted(response.json()["split_chunks"], key=lambda item: item["index"])
+
+        slow_seconds = chunks[0]["end_seconds"] - chunks[0]["start_seconds"] - chunks[0]["overlap_end_seconds"]
+        fast_seconds = chunks[1]["end_seconds"] - chunks[1]["start_seconds"] - chunks[1]["overlap_start_seconds"]
+        assert fast_seconds > slow_seconds * 4
+
+
+def test_partial_transcription_fields_and_segments_are_visible(monkeypatch):
+    monkeypatch.setattr(files_router, "probe_duration_seconds", fake_probe_duration)
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        upload = client.post(
+            "/api/v1/files",
+            files={"upload": ("partial.m4a", b"fake-audio", "audio/mp4")},
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["id"]
+
+        partial_payload = {
+            "transcription": [
+                {
+                    "timestamps": {"from": "00:00:00,000", "to": "00:00:02,000"},
+                    "offsets": {"from": 0, "to": 2000},
+                    "text": "first partial",
+                },
+                {
+                    "timestamps": {"from": "00:00:02,000", "to": "00:00:04,000"},
+                    "offsets": {"from": 2000, "to": 4000},
+                    "text": "second partial",
+                },
+            ]
+        }
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'partial-model', 'Partial Model', 'multilingual', '/models/tiny.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text,
+             partial_transcript_text, partial_transcript_json, partial_updated_at)
+            values (?, ?, ?, 'ru', 'running', 'Transcribing 50%', ?, ?, CURRENT_TIMESTAMP)
+            returning id
+            """,
+            (
+                admin_id,
+                file_id,
+                model_id,
+                "first partial\nsecond partial",
+                json.dumps(partial_payload),
+            ),
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        listed = client.get("/api/v1/transcriptions")
+        assert listed.status_code == 200
+        partial_job = next(item for item in listed.json() if item["id"] == job_id)
+        assert partial_job["partial_transcript_text"] == "first partial\nsecond partial"
+        assert partial_job["partial_updated_at"] is not None
+
+        auto_segments = client.get(f"/api/v1/transcriptions/{job_id}/segments")
+        assert auto_segments.status_code == 200
+        assert auto_segments.json() == [
+            {"start": 0.0, "end": 2.0, "text": "first partial"},
+            {"start": 2.0, "end": 4.0, "text": "second partial"},
+        ]
+
+        final_segments = client.get(f"/api/v1/transcriptions/{job_id}/segments?source=final")
+        assert final_segments.status_code == 409
+
+
 def test_projects_group_files_and_related_transcriptions(monkeypatch):
     monkeypatch.setattr(files_router, "probe_duration_seconds", fake_probe_duration)
     with TestClient(app) as client:
@@ -354,3 +709,302 @@ def test_project_assignment_is_owner_scoped(monkeypatch):
             )
             assert update.status_code == 200
             assert update.json()["project_id"] == own_project_id
+
+
+def test_whisper_cli_settings_are_admin_only():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+
+        current = client.get("/api/v1/system/whisper-cli")
+        assert current.status_code == 200
+        assert current.json()["whisper_threads"] == 4
+        assert current.json()["whisper_max_context"] == 0
+        assert "-mc" in current.json()["cli_preview"]
+
+        updated = client.patch(
+            "/api/v1/system/whisper-cli",
+            json={
+                "whisper_threads": 2,
+                "whisper_max_context": 128,
+                "whisper_use_gpu": False,
+                "whisper_flash_attn": False,
+                "whisper_suppress_non_speech": True,
+                "whisper_suppress_regex": "subtitle",
+                "transcript_filter_regex": "credits",
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["whisper_threads"] == 2
+        assert updated.json()["whisper_max_context"] == 128
+        assert updated.json()["whisper_suppress_regex"] == "subtitle"
+
+        created = client.post(
+            "/api/v1/users/",
+            json={
+                "username": "dave",
+                "email": "dave@example.com",
+                "password": "password1",
+                "role": "user",
+            },
+        )
+        assert created.status_code == 200
+
+        dave = TestClient(app)
+        with dave:
+            login = dave.post(
+                "/api/v1/auth/login",
+                json={"username": "dave", "password": "password1"},
+            )
+            assert login.status_code == 200
+            forbidden = dave.get("/api/v1/system/whisper-cli")
+            assert forbidden.status_code == 403
+
+        reset = client.post("/api/v1/system/whisper-cli/reset")
+        assert reset.status_code == 200
+        assert reset.json()["whisper_threads"] == 4
+        assert reset.json()["whisper_max_context"] == 0
+
+
+def test_telegram_bot_settings_are_admin_only_validated_and_masked(monkeypatch):
+    from app.routers import system as system_router
+
+    async def fake_restart():
+        return None
+
+    monkeypatch.setattr(system_router, "restart_telegram_bot", fake_restart)
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'telegram-model', 'Telegram Model', 'multilingual', '/models/tiny.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        created = client.post(
+            "/api/v1/users/",
+            json={
+                "username": "telegram_non_admin",
+                "email": "telegram-non-admin@example.com",
+                "password": "password1",
+                "role": "user",
+            },
+        )
+        assert created.status_code == 200
+
+        invalid = client.patch(
+            "/api/v1/system/telegram-bot",
+            json={
+                "enabled": True,
+                "bot_token": "123456:SECRET",
+                "default_model_id": model_id,
+                "default_language": "auto",
+                "allowed_users": [{"telegram_user_id": 1001, "app_user_id": 999999}],
+            },
+        )
+        assert invalid.status_code == 400
+
+        updated = client.patch(
+            "/api/v1/system/telegram-bot",
+            json={
+                "enabled": True,
+                "bot_token": "123456:SECRET",
+                "proxy_url": "http://proxy.internal:10809",
+                "default_model_id": model_id,
+                "default_language": "auto",
+                "allowed_users": [{"telegram_user_id": 1001, "app_user_id": admin_id}],
+            },
+        )
+        assert updated.status_code == 200
+        data = updated.json()
+        assert data["enabled"] is True
+        assert data["token_configured"] is True
+        assert data["token_preview"] == "1234...CRET"
+        assert "bot_token" not in data
+        assert data["proxy_url"] == "http://proxy.internal:10809"
+        assert data["allowed_users"] == [{"telegram_user_id": 1001, "app_user_id": admin_id}]
+
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "telegram_non_admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        forbidden = client.get("/api/v1/system/telegram-bot")
+        assert forbidden.status_code == 403
+
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        disabled = client.patch("/api/v1/system/telegram-bot", json={"enabled": False})
+        assert disabled.status_code == 200
+
+
+def test_cancel_requested_split_job_with_mixed_terminal_chunks_stays_cancelled():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'cancel-split-model', 'Cancel Split Model', 'multilingual', '/models/cancel.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'split.wav', 'split.wav', 'web', '/tmp/split.wav', 10, 600)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text,
+             split_enabled, split_status, cancel_requested_at, started_at)
+            values (?, ?, ?, 'ru', 'queued', 'Split transcription 0/2 chunks',
+             1, 'queued', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            returning id
+            """,
+            (admin_id, audio_id, model_id),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            insert into transcription_job_chunks
+            (parent_job_id, "index", start_seconds, end_seconds, overlap_start_seconds,
+             overlap_end_seconds, status, status_text, finished_at)
+            values (?, 0, 0, 300, 0, 5, 'cancelled', 'Cancelled', CURRENT_TIMESTAMP)
+            """,
+            (job_id,),
+        )
+        conn.execute(
+            """
+            insert into transcription_job_chunks
+            (parent_job_id, "index", start_seconds, end_seconds, overlap_start_seconds,
+             overlap_end_seconds, status, status_text, finished_at)
+            values (?, 1, 295, 600, 5, 0, 'succeeded', 'Chunk finished', CURRENT_TIMESTAMP)
+            """,
+            (job_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        async def merge() -> None:
+            async with async_session_factory() as db:
+                await try_merge_split_job(db, job_id)
+
+        asyncio.run(merge())
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        row = conn.execute(
+            "select status, split_status, status_text, finished_at from transcription_jobs where id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row[0] == "cancelled"
+        assert row[1] == "cancelled"
+        assert row[2] == "Cancelled"
+        assert row[3] is not None
+
+
+def test_cancel_running_split_job_cancels_queued_chunks_and_returns_cancelling():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'cancel-api-model', 'Cancel API Model', 'multilingual', '/models/cancel-api.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'split-api.wav', 'split-api.wav', 'web', '/tmp/split-api.wav', 10, 600)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text,
+             split_enabled, split_status, started_at)
+            values (?, ?, ?, 'ru', 'running', 'Split transcription running',
+             1, 'running', CURRENT_TIMESTAMP)
+            returning id
+            """,
+            (admin_id, audio_id, model_id),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            insert into transcription_job_chunks
+            (parent_job_id, "index", start_seconds, end_seconds, overlap_start_seconds,
+             overlap_end_seconds, status, status_text, started_at)
+            values (?, 0, 0, 300, 0, 5, 'running', 'Transcribing chunk', CURRENT_TIMESTAMP)
+            """,
+            (job_id,),
+        )
+        conn.execute(
+            """
+            insert into transcription_job_chunks
+            (parent_job_id, "index", start_seconds, end_seconds, overlap_start_seconds,
+             overlap_end_seconds, status, status_text)
+            values (?, 1, 295, 600, 5, 0, 'queued', 'Queued')
+            """,
+            (job_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        cancelled = client.post(f"/api/v1/transcriptions/{job_id}/cancel")
+        assert cancelled.status_code == 200
+        payload = cancelled.json()
+        assert payload["status"] == "running"
+        assert payload["split_status"] == "running"
+        assert payload["status_text"] == "Cancelling…"
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        rows = conn.execute(
+            "select status from transcription_job_chunks where parent_job_id = ? order by \"index\"",
+            (job_id,),
+        ).fetchall()
+        conn.close()
+
+        assert [row[0] for row in rows] == ["running", "cancelled"]

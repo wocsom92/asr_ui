@@ -3,10 +3,12 @@ import {
   AudioLines,
   LayoutDashboard,
   ListChecks,
+  FolderKanban,
   Users,
   Settings,
   FileAudio,
   Cpu,
+  ServerCog,
   Menu,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -27,11 +29,13 @@ const navItems = [
   { to: "/files", label: "Audio Files", icon: FileAudio },
   { to: "/jobs", label: "Jobs", icon: ListChecks },
   { to: "/transcriptions", label: "Transcriptions", icon: AudioLines },
+  { to: "/projects", label: "Projects", icon: FolderKanban },
   { to: "/settings", label: "Settings", icon: Settings },
 ]
 
 const adminItems = [
   { to: "/models", label: "Models", icon: Cpu },
+  { to: "/workers", label: "Workers", icon: ServerCog },
   { to: "/users", label: "Users", icon: Users },
 ]
 

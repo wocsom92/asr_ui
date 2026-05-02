@@ -13,6 +13,10 @@ usage() {
 Usage:
   scripts/deploy.sh --target <name> [options]
 
+Target modes:
+  remote                   Upload repo to a remote Docker host and run the full stack.
+  local-worker             Rebuild/restart only the local worker profile.
+
 Options:
   --target <name>            Target name from config file (required).
   --config <path>            Path to targets config (default: scripts/deploy.targets.env).
@@ -90,16 +94,14 @@ TARGET_ENV_FILE="$(get_target_var ENV_FILE)"
 TARGET_REMOTE_ENV_NAME="$(get_target_var REMOTE_ENV_NAME)"
 TARGET_DOCKER_USE_SUDO="$(get_target_var DOCKER_USE_SUDO)"
 TARGET_PURGE_MODE="$(get_target_var PURGE_MODE)"
+TARGET_WORKER_NAME="$(get_target_var WORKER_NAME)"
+TARGET_MODE="$(get_target_var MODE)"
+TARGET_SERVER_URL="$(get_target_var SERVER_URL)"
+TARGET_GIGAAM_TORCH_THREADS="$(get_target_var GIGAAM_TORCH_THREADS)"
+TARGET_GIGAAM_TORCH_INTEROP_THREADS="$(get_target_var GIGAAM_TORCH_INTEROP_THREADS)"
 
-[[ -n "${HOST}" ]] || die "Missing TARGET_${TARGET}_HOST in ${CONFIG_FILE}"
-[[ -n "${USER_NAME}" ]] || die "Missing TARGET_${TARGET}_USER in ${CONFIG_FILE}"
-[[ -n "${DEPLOY_PATH}" ]] || die "Missing TARGET_${TARGET}_DEPLOY_PATH in ${CONFIG_FILE}"
-[[ "${DEPLOY_PATH}" = /* ]] || die "DEPLOY_PATH must be absolute: ${DEPLOY_PATH}"
-
-case "${DEPLOY_PATH}" in
-  "/"|"/home"|"/root"|"/var"|"/usr"|"/opt"|"/tmp"|"/etc")
-    die "Refusing dangerous DEPLOY_PATH: ${DEPLOY_PATH}" ;;
-esac
+TARGET_MODE="${TARGET_MODE:-remote}"
+case "${TARGET_MODE}" in remote|local-worker) ;; *) die "Invalid TARGET_${TARGET}_MODE '${TARGET_MODE}'" ;; esac
 
 PORT="${PORT:-22}"
 AUTH_MODE="${AUTH_MODE:-${TARGET_AUTH:-key}}"
@@ -112,6 +114,62 @@ TARGET_PURGE_MODE="${PURGE_MODE:-${TARGET_PURGE_MODE:-managed}}"
 case "${AUTH_MODE}" in key|password) ;; *) die "Invalid --auth '${AUTH_MODE}'" ;; esac
 case "${TARGET_DOCKER_USE_SUDO}" in true|false) ;; *) die "Invalid DOCKER_USE_SUDO value '${TARGET_DOCKER_USE_SUDO}'" ;; esac
 case "${TARGET_PURGE_MODE}" in managed|full) ;; *) die "Invalid purge mode '${TARGET_PURGE_MODE}'" ;; esac
+
+if [[ "${TARGET_MODE}" == "local-worker" ]]; then
+  require_cmd docker
+  [[ -f "${SOURCE_ROOT}/docker-compose.yml" ]] || die "docker-compose.yml not found in ${SOURCE_ROOT}"
+
+  if [[ -n "${TARGET_ENV_FILE}" ]]; then
+    if [[ "${TARGET_ENV_FILE}" = /* ]]; then
+      LOCAL_ENV_FILE="${TARGET_ENV_FILE}"
+    else
+      LOCAL_ENV_FILE="${SOURCE_ROOT}/${TARGET_ENV_FILE}"
+    fi
+    [[ -f "${LOCAL_ENV_FILE}" ]] || die "Configured env file not found: ${LOCAL_ENV_FILE}"
+  fi
+
+  if [[ "${ASSUME_YES}" -ne 1 ]]; then
+    echo ""
+    echo "  ASR UI Local Worker Deploy"
+    echo "  ─────────────────────────────────────"
+    echo "  Target:       ${TARGET}"
+    echo "  Source root:  ${SOURCE_ROOT}"
+    if [[ -n "${TARGET_WORKER_NAME}" ]]; then echo "  Worker name:  ${TARGET_WORKER_NAME}"; fi
+    if [[ -n "${TARGET_SERVER_URL}" ]]; then echo "  Server URL:   ${TARGET_SERVER_URL}"; fi
+    if [[ -n "${TARGET_ENV_FILE}" ]]; then echo "  Env file:     ${LOCAL_ENV_FILE}"; fi
+    echo ""
+    read -r -p "  Continue? [y/N] " confirm
+    [[ "${confirm}" =~ ^[Yy]$ ]] || die "Aborted by user."
+    echo ""
+  fi
+
+  log "Rebuilding and restarting local worker..."
+  (
+    cd "${SOURCE_ROOT}"
+    if [[ -n "${TARGET_WORKER_NAME}" ]]; then export ASR_WORKER_NAME="${TARGET_WORKER_NAME}"; fi
+    if [[ -n "${TARGET_SERVER_URL}" ]]; then export ASR_SERVER_URL="${TARGET_SERVER_URL}"; fi
+    if [[ -n "${TARGET_GIGAAM_TORCH_THREADS}" ]]; then export GIGAAM_TORCH_THREADS="${TARGET_GIGAAM_TORCH_THREADS}"; fi
+    if [[ -n "${TARGET_GIGAAM_TORCH_INTEROP_THREADS}" ]]; then export GIGAAM_TORCH_INTEROP_THREADS="${TARGET_GIGAAM_TORCH_INTEROP_THREADS}"; fi
+    docker compose --profile worker up -d --build worker
+  )
+  log "Worker status:"
+  (cd "${SOURCE_ROOT}" && docker compose ps worker)
+  log "──────────────────────────────────────────"
+  log "Local worker deploy to ${TARGET} completed successfully."
+  log "Logs: cd \"${SOURCE_ROOT}\" && docker compose logs -f worker"
+  log "──────────────────────────────────────────"
+  exit 0
+fi
+
+[[ -n "${HOST}" ]] || die "Missing TARGET_${TARGET}_HOST in ${CONFIG_FILE}"
+[[ -n "${USER_NAME}" ]] || die "Missing TARGET_${TARGET}_USER in ${CONFIG_FILE}"
+[[ -n "${DEPLOY_PATH}" ]] || die "Missing TARGET_${TARGET}_DEPLOY_PATH in ${CONFIG_FILE}"
+[[ "${DEPLOY_PATH}" = /* ]] || die "DEPLOY_PATH must be absolute: ${DEPLOY_PATH}"
+
+case "${DEPLOY_PATH}" in
+  "/"|"/home"|"/root"|"/var"|"/usr"|"/opt"|"/tmp"|"/etc")
+    die "Refusing dangerous DEPLOY_PATH: ${DEPLOY_PATH}" ;;
+esac
 
 if [[ "${AUTH_MODE}" == "key" ]]; then
   [[ -n "${KEY_PATH}" ]] || KEY_PATH="${HOME}/.ssh/id_rsa"
@@ -205,6 +263,19 @@ copy_into_stage() {
   fi
 }
 
+set_env_value() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  local tmp_file="${env_file}.tmp"
+  if [[ -f "${env_file}" ]] && grep -q "^${key}=" "${env_file}"; then
+    awk -v key="${key}" -v value="${value}" 'BEGIN { done = 0 } $0 ~ "^" key "=" { print key "=" value; done = 1; next } { print } END { if (!done) print key "=" value }' "${env_file}" > "${tmp_file}"
+    mv "${tmp_file}" "${env_file}"
+  else
+    printf '%s=%s\n' "${key}" "${value}" >> "${env_file}"
+  fi
+}
+
 log "Preparing staging directory..."
 for item in "${DEPLOY_ITEMS[@]}"; do
   log "  staging: ${item}"
@@ -212,6 +283,15 @@ for item in "${DEPLOY_ITEMS[@]}"; do
 done
 if [[ -n "${LOCAL_ENV_FILE}" ]]; then
   cp "${LOCAL_ENV_FILE}" "${stage_dir}/${TARGET_REMOTE_ENV_NAME}"
+  if [[ -n "${TARGET_WORKER_NAME}" ]]; then
+    set_env_value "${stage_dir}/${TARGET_REMOTE_ENV_NAME}" "ASR_WORKER_NAME" "${TARGET_WORKER_NAME}"
+  fi
+  if [[ -n "${TARGET_GIGAAM_TORCH_THREADS}" ]]; then
+    set_env_value "${stage_dir}/${TARGET_REMOTE_ENV_NAME}" "GIGAAM_TORCH_THREADS" "${TARGET_GIGAAM_TORCH_THREADS}"
+  fi
+  if [[ -n "${TARGET_GIGAAM_TORCH_INTEROP_THREADS}" ]]; then
+    set_env_value "${stage_dir}/${TARGET_REMOTE_ENV_NAME}" "GIGAAM_TORCH_INTEROP_THREADS" "${TARGET_GIGAAM_TORCH_INTEROP_THREADS}"
+  fi
 fi
 
 log "Checking SSH connectivity..."

@@ -6,11 +6,12 @@ import { toast } from "sonner"
 
 import api from "@/api/client"
 import { PaginationControls } from "@/components/PaginationControls"
+import { ProjectBadge } from "@/components/ProjectBadge"
 import { TranscriptAudioPlayer } from "@/components/TranscriptAudioPlayer"
 import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Textarea } from "@/components/ui/textarea"
 import { audioTitle } from "@/lib/audio"
 import { formatDateTimeLocal } from "@/lib/datetime"
 import { formatBytes, formatDuration } from "@/lib/format"
@@ -50,21 +51,21 @@ export default function Transcriptions() {
     }
   }, [projectFilter, projects, projectsLoading])
 
-  const finishedJobs = useMemo(
-    () => jobs.filter((job) => job.status === "succeeded"),
+  const visibleJobs = useMemo(
+    () => jobs.filter((job) => job.status === "succeeded" || Boolean(job.partial_transcript_text)),
     [jobs]
   )
-  const pageCount = Math.max(1, Math.ceil(finishedJobs.length / PAGE_SIZE))
-  const pagedJobs = finishedJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const pageCount = Math.max(1, Math.ceil(visibleJobs.length / PAGE_SIZE))
+  const pagedJobs = visibleJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
   const linkedJobId = Number(searchParams.get("job"))
 
   useEffect(() => {
     if (!linkedJobId) return
-    const jobIndex = finishedJobs.findIndex((job) => job.id === linkedJobId)
+    const jobIndex = visibleJobs.findIndex((job) => job.id === linkedJobId)
     if (jobIndex === -1) return
     setExpandedId(linkedJobId)
     setPage(Math.floor(jobIndex / PAGE_SIZE) + 1)
-  }, [finishedJobs, linkedJobId])
+  }, [visibleJobs, linkedJobId])
 
   useEffect(() => {
     if (page > pageCount) setPage(pageCount)
@@ -121,10 +122,10 @@ export default function Transcriptions() {
         <div className="flex justify-center py-12">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
-      ) : finishedJobs.length === 0 ? (
+      ) : visibleJobs.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-sm text-muted-foreground">
-            No finished transcriptions yet. Check Jobs for queued, running, failed, or cancelled work.
+            No finished or partial transcriptions yet. Check Jobs for queued, running, failed, or cancelled work.
           </CardContent>
         </Card>
       ) : (
@@ -132,7 +133,7 @@ export default function Transcriptions() {
           <PaginationControls
             page={page}
             pageCount={pageCount}
-            totalItems={finishedJobs.length}
+            totalItems={visibleJobs.length}
             pageSize={PAGE_SIZE}
             itemLabel="transcriptions"
             onPageChange={setPage}
@@ -140,6 +141,8 @@ export default function Transcriptions() {
 
           {pagedJobs.map((job) => {
             const expanded = expandedId === job.id
+            const isFinal = job.status === "succeeded"
+            const transcriptText = isFinal ? job.transcript_text : job.partial_transcript_text
 
             return (
               <Card key={job.id} className={expanded ? "border-primary" : ""}>
@@ -158,11 +161,18 @@ export default function Transcriptions() {
                       <p className="mt-1 truncate text-xs text-muted-foreground">
                         {job.model?.display_name ?? job.model?.variant ?? "model"} · {job.language}
                       </p>
+                      {!isFinal && (
+                        <Badge variant="outline" className="mt-2 border-amber-300 bg-amber-50 text-amber-800">
+                          Partial
+                        </Badge>
+                      )}
+                      <div className="mt-2">
+                        <ProjectBadge project={job.audio_file?.project} />
+                      </div>
                       <p className="mt-1 truncate text-xs text-muted-foreground">
-                        Project: {job.audio_file?.project?.name ?? "Unassigned"}
-                      </p>
-                      <p className="mt-1 truncate text-xs text-muted-foreground">
-                        Finished {job.finished_at ? formatDateTimeLocal(job.finished_at) : formatDateTimeLocal(job.created_at)} · Runtime {jobRuntime(job)}
+                        {isFinal
+                          ? `Finished ${job.finished_at ? formatDateTimeLocal(job.finished_at) : formatDateTimeLocal(job.created_at)}`
+                          : `Partial updated ${job.partial_updated_at ? formatDateTimeLocal(job.partial_updated_at) : formatDateTimeLocal(job.created_at)}`} · Runtime {jobRuntime(job)}
                       </p>
                     </div>
                   </div>
@@ -179,7 +189,13 @@ export default function Transcriptions() {
                   <CardContent className="space-y-4 border-t pt-4">
                     <div className="flex flex-wrap gap-2">
                       {TRANSCRIPT_OUTPUTS.map((output) => (
-                        <Button key={output.format} variant="outline" size="sm" onClick={() => download(job, output.format)}>
+                        <Button
+                          key={output.format}
+                          variant="outline"
+                          size="sm"
+                          disabled={!isFinal}
+                          onClick={() => download(job, output.format)}
+                        >
                           <Download className="mr-2 h-3 w-3" />
                           {output.format}
                           <span className="ml-2 text-xs text-muted-foreground">{formatBytes(job[output.sizeKey])}</span>
@@ -203,10 +219,10 @@ export default function Transcriptions() {
                           </div>
                         }
                       />
-                      <MetadataItem label="Finished" value={job.finished_at ? formatDateTimeLocal(job.finished_at) : "Unknown"} />
+                      <MetadataItem label={isFinal ? "Finished" : "Partial Updated"} value={isFinal ? (job.finished_at ? formatDateTimeLocal(job.finished_at) : "Unknown") : (job.partial_updated_at ? formatDateTimeLocal(job.partial_updated_at) : "Unknown")} />
                       <MetadataItem label="Model" value={job.model?.variant ?? "Unknown"} />
                       <MetadataItem label="Language" value={job.language} />
-                      <MetadataItem label="Project" value={job.audio_file?.project?.name ?? "Unassigned"} />
+                      <MetadataItem label="Project" value={<ProjectBadge project={job.audio_file?.project} />} />
                       <MetadataItem
                         label="Transcript Files"
                         value={
@@ -222,15 +238,17 @@ export default function Transcriptions() {
                       />
                     </div>
 
-                    <TranscriptAudioPlayer job={job} />
-
-                    <Textarea className="min-h-[360px] font-mono text-sm" readOnly value={job.transcript_text ?? ""} />
+                    <TranscriptAudioPlayer
+                      job={job}
+                      source={isFinal ? "auto" : "partial"}
+                      title={isFinal ? "Live transcript" : "Partial transcript"}
+                    />
 
                     <div className="flex flex-wrap gap-2">
                       <Button
                         variant="outline"
                         onClick={() => {
-                          navigator.clipboard.writeText(job.transcript_text ?? "")
+                          navigator.clipboard.writeText(transcriptText ?? "")
                           toast.success("Transcript copied")
                         }}
                       >
@@ -238,7 +256,7 @@ export default function Transcriptions() {
                       </Button>
                       <Button
                         variant="outline"
-                        disabled={deleteMutation.isPending}
+                        disabled={deleteMutation.isPending || job.status === "running"}
                         className="border-destructive/40 text-destructive hover:bg-destructive/10"
                         onClick={() => {
                           if (window.confirm("Delete this transcription and all generated output files?")) {
@@ -259,7 +277,7 @@ export default function Transcriptions() {
           <PaginationControls
             page={page}
             pageCount={pageCount}
-            totalItems={finishedJobs.length}
+            totalItems={visibleJobs.length}
             pageSize={PAGE_SIZE}
             itemLabel="transcriptions"
             onPageChange={setPage}

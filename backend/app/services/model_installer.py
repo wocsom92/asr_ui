@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.database import async_session_factory
 from app.models.transcription_model import TranscriptionModel
-from app.services.model_catalog import get_catalog_item
+from app.services.model_catalog import GIGAAM_REPO_ID, get_catalog_item, gigaam_revision
 
 _active_installs: dict[int, asyncio.Task] = {}
 
@@ -83,10 +83,14 @@ async def install_model(model_id: int) -> None:
         model.download_url = catalog_item.download_url
 
         target = Path(model.path)
-        tmp_target = target.with_suffix(target.suffix + ".part")
+        tmp_target = target.with_suffix(target.suffix + ".part") if target.suffix else target.with_name(target.name + ".part")
         target.parent.mkdir(parents=True, exist_ok=True)
 
         try:
+            if catalog_item.provider == "gigaam":
+                await _install_gigaam_model(db, model, target)
+                return
+
             if target.exists() and target.stat().st_size > 0:
                 model.status = "installed"
                 model.size_bytes = target.stat().st_size
@@ -175,3 +179,68 @@ async def install_model(model_id: int) -> None:
             model.error_message = str(exc)
 
         await db.commit()
+
+
+def _directory_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+async def _install_gigaam_model(db, model: TranscriptionModel, target: Path) -> None:
+    revision = gigaam_revision(model.variant)
+    if revision is None:
+        model.status = "failed"
+        model.status_text = "Install failed"
+        model.error_message = f"Unknown GigaAM variant: {model.variant}"
+        await db.commit()
+        return
+
+    complete_marker = target / ".complete"
+    if complete_marker.exists():
+        size = _directory_size(target)
+        model.status = "installed"
+        model.size_bytes = size
+        model.downloaded_bytes = size
+        model.total_bytes = size
+        model.status_text = "Already installed"
+        model.installed_at = datetime.now(timezone.utc)
+        model.error_message = None
+        await db.commit()
+        return
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        model.status = "failed"
+        model.status_text = "Install failed"
+        model.error_message = (
+            "GigaAM support requires huggingface_hub, transformers, torch, "
+            "torchaudio, hydra-core, omegaconf, "
+            "and sentencepiece. Rebuild the backend image with updated requirements."
+        )
+        await db.commit()
+        return
+
+    model.status = "installing"
+    model.downloaded_bytes = _directory_size(target) if target.exists() else 0
+    model.total_bytes = None
+    model.status_text = f"Downloading Hugging Face snapshot ({revision})"
+    model.error_message = None
+    await db.commit()
+
+    await asyncio.to_thread(
+        snapshot_download,
+        repo_id=GIGAAM_REPO_ID,
+        revision=revision,
+        local_dir=str(target),
+        local_dir_use_symlinks=False,
+    )
+    complete_marker.touch()
+    size = _directory_size(target)
+    model.status = "installed"
+    model.size_bytes = size
+    model.downloaded_bytes = size
+    model.total_bytes = size
+    model.status_text = "Installed"
+    model.installed_at = datetime.now(timezone.utc)
+    model.error_message = None
+    await db.commit()

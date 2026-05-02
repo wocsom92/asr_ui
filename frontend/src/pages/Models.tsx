@@ -1,13 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Cpu, Loader2, Square, Trash2 } from "lucide-react"
+import { Cpu, Gauge, Loader2, Square, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import api from "@/api/client"
-import type { ModelCatalogItem, TranscriptionModel } from "@/types"
+import type { ModelCatalogItem, ModelStats, TranscriptionModel, TranscriptionWorker } from "@/types"
 import { useAuthStore } from "@/stores/auth"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { formatBytes } from "@/lib/format"
+import { formatBytes, formatDuration, formatElapsedMs } from "@/lib/format"
 
 function installPercent(model: TranscriptionModel): number | null {
   if (!model.total_bytes || model.total_bytes <= 0) return null
@@ -40,6 +40,43 @@ function InstallProgress({ model }: { model: TranscriptionModel }) {
   )
 }
 
+function workerStatsLabel(stats: ModelStats) {
+  return stats.worker_name || (stats.worker_id ? `Worker #${stats.worker_id}` : "Unknown worker")
+}
+
+function workerLabel(worker: TranscriptionWorker) {
+  return worker.display_name || worker.name
+}
+
+function installVariantFor(item: ModelCatalogItem) {
+  return item.model_variant || item.variant
+}
+
+function workerHasModel(worker: TranscriptionWorker, item: ModelCatalogItem) {
+  const installVariant = installVariantFor(item)
+  return worker.models.some((model) => model.variant === installVariant || model.variant === item.variant)
+}
+
+function workerIsInstalling(worker: TranscriptionWorker, item: ModelCatalogItem) {
+  const installVariant = installVariantFor(item)
+  return worker.installs.some((model) => model.variant === installVariant || model.variant === item.variant)
+}
+
+function workerInstallRequested(worker: TranscriptionWorker, item: ModelCatalogItem) {
+  const installVariant = installVariantFor(item)
+  return worker.requested_installs.some(
+    (variant) =>
+      variant === item.variant ||
+      variant === installVariant ||
+      variant.replace(/\.ru$/, "") === installVariant,
+  )
+}
+
+function installedWorkerVariant(worker: TranscriptionWorker, item: ModelCatalogItem) {
+  const installVariant = installVariantFor(item)
+  return worker.models.find((model) => model.variant === installVariant || model.variant === item.variant)?.variant
+}
+
 export default function Models() {
   const user = useAuthStore((s) => s.user)
   const qc = useQueryClient()
@@ -57,7 +94,18 @@ export default function Models() {
         ? 1000
         : 5000,
   })
-
+  const { data: modelStats = [] } = useQuery<ModelStats[]>({
+    queryKey: ["models", "stats"],
+    queryFn: () => api.get("/models/stats").then((r) => r.data),
+    enabled: user?.role === "admin",
+    refetchInterval: 10000,
+  })
+  const { data: workers = [] } = useQuery<TranscriptionWorker[]>({
+    queryKey: ["workers"],
+    queryFn: () => api.get("/workers").then((r) => r.data),
+    enabled: user?.role === "admin",
+    refetchInterval: 3000,
+  })
   const installMutation = useMutation({
     mutationFn: (variant: string) => api.post("/models/install", { variant }),
     onSuccess: () => {
@@ -82,25 +130,129 @@ export default function Models() {
     },
     onError: (err: any) => toast.error(err.response?.data?.detail || "Cancel failed"),
   })
-
+  const workerInstallMutation = useMutation({
+    mutationFn: ({ workerId, variant }: { workerId: number; variant: string }) =>
+      api.post(`/workers/${workerId}/install-model`, { variant }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["workers"] })
+      toast.success("Worker model install requested")
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Could not request worker install"),
+  })
+  const workerUninstallMutation = useMutation({
+    mutationFn: ({ workerId, variant }: { workerId: number; variant: string }) =>
+      api.post(`/workers/${workerId}/uninstall-model`, { variant }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["workers"] })
+      toast.success("Worker model uninstall requested")
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Could not request worker uninstall"),
+  })
   if (user?.role !== "admin") {
     return <div className="py-12 text-center text-muted-foreground">Admin access required.</div>
   }
 
   const modelByVariant = new Map(models.map((model) => [model.variant, model]))
   const catalogByVariant = new Map(catalog.map((item) => [item.variant, item]))
+  const statsByModelId = new Map<number, ModelStats[]>()
+  for (const item of modelStats) {
+    const current = statsByModelId.get(item.model_id) ?? []
+    current.push(item)
+    statsByModelId.set(item.model_id, current)
+  }
   const installedModels = models
     .filter((model) => model.status === "installed")
     .sort((a, b) => a.display_name.localeCompare(b.display_name))
   const catalogItems = catalog.filter(
     (item) => modelByVariant.get(item.variant)?.status !== "installed"
   )
+  const acceptedWorkers = workers
+    .filter((worker) => worker.accepted && !worker.is_deleted)
+    .sort((a, b) => workerLabel(a).localeCompare(workerLabel(b), undefined, {
+      sensitivity: "base",
+      numeric: true,
+    }))
+
+  const renderWorkerModelControls = (item: ModelCatalogItem) => {
+    if (acceptedWorkers.length === 0) {
+      return (
+        <p className="rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
+          No accepted workers yet.
+        </p>
+      )
+    }
+    return (
+      <div className="space-y-2">
+        {acceptedWorkers.map((worker) => {
+          const installed = workerHasModel(worker, item)
+          const installing = workerIsInstalling(worker, item)
+          const installRequested = workerInstallRequested(worker, item)
+          const installedVariant = installedWorkerVariant(worker, item)
+          const uninstallRequested = Boolean(installedVariant && worker.requested_uninstalls.includes(installedVariant))
+          const busy = worker.online && ["running", "installing", "uninstalling"].includes(worker.status)
+          const disabled =
+            workerInstallMutation.isPending ||
+            workerUninstallMutation.isPending ||
+            installing ||
+            installRequested ||
+            uninstallRequested ||
+            (installed && busy)
+          return (
+            <div
+              key={`${item.variant}-${worker.id}`}
+              className="flex items-center justify-between gap-3 rounded-md border bg-muted/20 px-3 py-2"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-sm font-medium">{workerLabel(worker)}</p>
+                <p className="text-xs text-muted-foreground">
+                  {installed
+                    ? `installed${uninstallRequested ? " · uninstall requested" : ""}`
+                    : installing
+                      ? "installing"
+                      : installRequested
+                        ? "install requested"
+                        : worker.online
+                          ? worker.status
+                          : "offline"}
+                </p>
+              </div>
+              {installed ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={disabled || !installedVariant}
+                  onClick={() => {
+                    if (installedVariant && window.confirm(`Uninstall ${installedVariant} from ${workerLabel(worker)}?`)) {
+                      workerUninstallMutation.mutate({ workerId: worker.id, variant: installedVariant })
+                    }
+                  }}
+                >
+                  <Trash2 className="mr-2 h-3 w-3" />
+                  Uninstall
+                </Button>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={disabled}
+                  onClick={() => workerInstallMutation.mutate({ workerId: worker.id, variant: item.variant })}
+                >
+                  {workerInstallMutation.isPending && <Loader2 className="mr-2 h-3 w-3 animate-spin" />}
+                  Install
+                </Button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Models</h1>
-        <p className="text-muted-foreground">Install and manage local whisper.cpp GGML models.</p>
+        <p className="text-muted-foreground">Install and manage local ASR models.</p>
       </div>
 
       {catalogLoading ? (
@@ -118,6 +270,12 @@ export default function Models() {
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {installedModels.map((model) => {
                   const catalogItem = catalogByVariant.get(model.variant)
+                  const stats = (statsByModelId.get(model.id) ?? []).sort((a, b) =>
+                    workerStatsLabel(a).localeCompare(workerStatsLabel(b), undefined, {
+                      sensitivity: "base",
+                      numeric: true,
+                    })
+                  )
                   return (
                     <Card key={model.id}>
                       <CardHeader>
@@ -162,6 +320,56 @@ export default function Models() {
                             {model.download_url ?? "Unknown"}
                           </a>
                         </div>
+                        <div className="rounded-md border bg-muted/30 p-3">
+                          <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+                            <Gauge className="h-4 w-4" />
+                            Transcription speed
+                          </div>
+                          {stats.length > 0 ? (
+                            <div className="space-y-3">
+                              {stats.map((item) => (
+                                <div key={`${item.worker_id ?? "unknown"}-${item.worker_name ?? "unknown"}`} className="rounded-md border bg-background/60 p-3">
+                                  <div className="mb-2 flex items-center justify-between gap-2">
+                                    <p className="truncate text-sm font-medium">{workerStatsLabel(item)}</p>
+                                    <Badge variant="outline">{item.completed_job_count} samples</Badge>
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-3 text-sm">
+                                    <div>
+                                      <p className="text-muted-foreground">Per audio hour</p>
+                                      <p className="font-medium">{formatElapsedMs(item.runtime_per_audio_hour_seconds * 1000)}</p>
+                                    </div>
+                                    <div>
+                                      <p className="text-muted-foreground">Median</p>
+                                      <p className="font-medium">
+                                        {item.median_runtime_per_audio_hour_seconds
+                                          ? formatElapsedMs(item.median_runtime_per_audio_hour_seconds * 1000)
+                                          : "Unknown"}
+                                      </p>
+                                    </div>
+                                    <div>
+                                      <p className="text-muted-foreground">Audio processed</p>
+                                      <p className="font-medium">{formatDuration(item.total_audio_seconds)}</p>
+                                    </div>
+                                    <div>
+                                      <p className="text-muted-foreground">Runtime</p>
+                                      <p className="font-medium">{formatElapsedMs(item.total_runtime_seconds * 1000)}</p>
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-sm text-muted-foreground">
+                              No completed jobs with audio duration yet.
+                            </p>
+                          )}
+                        </div>
+                        {catalogItem && (
+                          <div className="rounded-md border bg-muted/30 p-3">
+                            <p className="mb-2 text-sm font-medium">Workers</p>
+                            {renderWorkerModelControls(catalogItem)}
+                          </div>
+                        )}
                         <div className="flex items-center justify-between gap-2">
                           <Badge variant="default">
                             installed
@@ -228,6 +436,10 @@ export default function Models() {
                         <p className="rounded-md bg-destructive/10 p-2 text-xs text-destructive">{installed.error_message}</p>
                       )}
                       {installed?.status === "installing" && <InstallProgress model={installed} />}
+                      <div className="rounded-md border bg-muted/30 p-3">
+                        <p className="mb-2 text-sm font-medium">Workers</p>
+                        {renderWorkerModelControls(item)}
+                      </div>
                       <div className="flex items-center justify-between gap-2">
                         <Badge variant={installed?.status === "failed" ? "destructive" : "secondary"}>
                           {installed ? `${installed.status}${installed.size_bytes ? ` · ${formatBytes(installed.size_bytes)}` : ""}` : "not installed"}

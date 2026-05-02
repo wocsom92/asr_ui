@@ -27,3 +27,15 @@ class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     password: Optional[str] = Field(default=None, min_length=6, max_length=200)
     role: Optional[str] = None
+
+
+class UserStatsOut(BaseModel):
+    user_id: int
+    username: str
+    email: EmailStr
+    role: str
+    audio_file_count: int
+    transcription_count: int
+    running_job_count: int
+    web_audio_count: int
+    telegram_audio_count: int

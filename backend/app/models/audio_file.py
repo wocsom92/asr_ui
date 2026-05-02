@@ -18,6 +18,7 @@ class AudioFile(Base):
     original_filename: Mapped[str] = mapped_column(String(255))
     display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     stored_path: Mapped[str] = mapped_column(String(1000))
     mime_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     size_bytes: Mapped[int] = mapped_column(Integer)

@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,12 +17,14 @@ from app.models.audio_file import AudioFile
 from app.models.project import Project
 from app.models.transcription_job import TranscriptionJob
 from app.models.transcription_model import TranscriptionModel
+from app.models.transcription_worker import TranscriptionWorker
 from app.models.user import User
 from app.schemas.files import AudioFileOut, AudioFileUpdate
 from app.schemas.transcription import TranscriptionCreate, TranscriptionJobOut
 from app.services.audio_svc import is_supported_audio, probe_duration_seconds
 from app.services.transcriber import TranscriptionError, validate_transcription_runtime
 from app.services.transcription_files import delete_transcription_outputs
+from app.services.worker_runtime import create_split_chunks
 
 router = APIRouter(prefix="/api/v1/files", tags=["files"])
 
@@ -114,6 +119,7 @@ async def upload_file(
         project_id=validated_project_id,
         original_filename=filename,
         display_name=filename,
+        source="web",
         stored_path=str(stored_path),
         mime_type=upload.content_type,
         size_bytes=size,
@@ -259,11 +265,6 @@ async def create_transcription(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    try:
-        validate_transcription_runtime()
-    except TranscriptionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
     audio_result = await db.execute(
         select(AudioFile)
         .options(selectinload(AudioFile.project))
@@ -282,10 +283,53 @@ async def create_transcription(
     model = model_result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Installed model not found")
+    if model.provider != "gigaam":
+        try:
+            validate_transcription_runtime()
+        except TranscriptionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     if model.language_mode == "english" and body.language not in {"auto", "en"}:
         raise HTTPException(status_code=400, detail="English-only models only support English")
     if model.language_mode == "russian" and body.language not in {"auto", "ru"}:
         raise HTTPException(status_code=400, detail="Russian model profiles only support Russian")
+
+    preferred_worker = None
+    split_workers: list[TranscriptionWorker] = []
+    if body.split_enabled and body.split_worker_ids:
+        worker_result = await db.execute(
+            select(TranscriptionWorker).where(
+                TranscriptionWorker.id.in_(body.split_worker_ids),
+                TranscriptionWorker.accepted.is_(True),
+                TranscriptionWorker.is_deleted.is_not(True),
+            )
+        )
+        found_by_id = {worker.id: worker for worker in worker_result.scalars().all()}
+        missing_ids = [worker_id for worker_id in body.split_worker_ids if worker_id not in found_by_id]
+        if missing_ids:
+            raise HTTPException(status_code=404, detail="One or more selected split workers were not found")
+        split_workers = [found_by_id[worker_id] for worker_id in body.split_worker_ids]
+        if len(split_workers) < 2:
+            raise HTTPException(status_code=400, detail="Choose at least two workers for split transcription")
+    elif body.preferred_worker_id is not None:
+        worker_result = await db.execute(
+            select(TranscriptionWorker).where(
+                TranscriptionWorker.id == body.preferred_worker_id,
+                TranscriptionWorker.accepted.is_(True),
+                TranscriptionWorker.is_deleted.is_not(True),
+            )
+        )
+        preferred_worker = worker_result.scalar_one_or_none()
+        if not preferred_worker:
+            raise HTTPException(status_code=404, detail="Selected worker not found")
+    else:
+        worker_result = await db.execute(
+            select(TranscriptionWorker).where(
+                TranscriptionWorker.name == "raspi5",
+                TranscriptionWorker.accepted.is_(True),
+                TranscriptionWorker.is_deleted.is_not(True),
+            )
+        )
+        preferred_worker = worker_result.scalar_one_or_none()
 
     language = body.language
     if model.language_mode == "english" and body.language == "auto":
@@ -299,8 +343,21 @@ async def create_transcription(
         language=language,
         status="queued",
         status_text="Waiting for worker",
+        preferred_worker_id=None if split_workers else (preferred_worker.id if preferred_worker else None),
+        preferred_worker_name_snapshot=(
+            f"Splitter: {', '.join(worker.display_name or worker.name for worker in split_workers)}"
+            if split_workers
+            else preferred_worker.name if preferred_worker else None
+        ),
+        split_worker_ids_json=json.dumps([worker.id for worker in split_workers]) if split_workers else None,
+        split_enabled=body.split_enabled,
+        split_status="queued" if body.split_enabled else None,
     )
     db.add(job)
+    await db.flush()
+    if body.split_enabled:
+        job.audio_file = audio
+        await create_split_chunks(db, job)
     await db.commit()
 
     result = await db.execute(
@@ -309,6 +366,7 @@ async def create_transcription(
             selectinload(TranscriptionJob.audio_file),
             selectinload(TranscriptionJob.audio_file).selectinload(AudioFile.project),
             selectinload(TranscriptionJob.model),
+            selectinload(TranscriptionJob.chunks),
         )
         .where(TranscriptionJob.id == job.id)
     )

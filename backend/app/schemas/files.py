@@ -15,6 +15,7 @@ class AudioFileOut(BaseModel):
     original_filename: str
     display_name: Optional[str]
     notes: Optional[str]
+    source: Optional[str] = None
     mime_type: Optional[str]
     size_bytes: int
     duration_seconds: Optional[float]

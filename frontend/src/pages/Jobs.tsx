@@ -6,6 +6,7 @@ import { toast } from "sonner"
 
 import api from "@/api/client"
 import { PaginationControls } from "@/components/PaginationControls"
+import { TranscriptAudioPlayer } from "@/components/TranscriptAudioPlayer"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -30,9 +31,166 @@ import {
   queueWait,
   statusIcon,
 } from "@/lib/jobs"
-import type { TranscriptionJob } from "@/types"
+import type { TranscriptionJob, TranscriptionJobChunk } from "@/types"
 
 const PAGE_SIZE = 20
+const WORKER_COLORS = [
+  "bg-blue-600",
+  "bg-emerald-600",
+  "bg-amber-600",
+  "bg-fuchsia-600",
+  "bg-cyan-700",
+  "bg-rose-600",
+  "bg-lime-700",
+  "bg-indigo-600",
+]
+
+function chunkCoreSeconds(chunk: TranscriptionJobChunk) {
+  return Math.max(
+    chunk.end_seconds - chunk.start_seconds - chunk.overlap_start_seconds - chunk.overlap_end_seconds,
+    0
+  )
+}
+
+function workerColor(workerName: string | null | undefined, colorMap: Map<string, string>) {
+  if (!workerName) return "bg-slate-400"
+  return colorMap.get(workerName) ?? "bg-slate-400"
+}
+
+function workerColorMap(chunks: TranscriptionJobChunk[]) {
+  const workers = Array.from(
+    new Set(chunks.map((chunk) => chunk.worker_name_snapshot).filter((name): name is string => Boolean(name)))
+  ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }))
+  return new Map(workers.map((worker, index) => [worker, WORKER_COLORS[index % WORKER_COLORS.length]]))
+}
+
+function chunkProgress(chunk: TranscriptionJobChunk) {
+  if (chunk.status === "succeeded") return 100
+  if (chunk.status === "failed" || chunk.status === "cancelled") return 100
+  if (chunk.status === "queued") return 0
+  const match = (chunk.status_text ?? "").match(/(\d{1,3})%/)
+  if (!match) return 35
+  const value = Number(match[1])
+  return Number.isFinite(value) ? Math.max(5, Math.min(99, value)) : 35
+}
+
+function chunkStatusClass(chunk: TranscriptionJobChunk, colorMap: Map<string, string>) {
+  if (chunk.status === "failed") return "bg-destructive"
+  if (chunk.status === "cancelled") return "bg-gray-500"
+  if (chunk.status === "queued") return "bg-slate-300 dark:bg-slate-700"
+  return workerColor(chunk.worker_name_snapshot, colorMap)
+}
+
+function chunkWorkerLabel(chunk: TranscriptionJobChunk) {
+  return chunk.worker_name_snapshot ?? (chunk.status === "queued" ? "Waiting" : "Unassigned")
+}
+
+function SplitChunkTimeline({ job }: { job: TranscriptionJob }) {
+  const chunks = [...(job.split_chunks ?? [])].sort((a, b) => a.index - b.index)
+  if (!job.split_enabled || chunks.length === 0) return null
+  const colorMap = workerColorMap(chunks)
+
+  const totalSeconds = Math.max(
+    chunks.reduce((sum, chunk) => sum + chunkCoreSeconds(chunk), 0),
+    1
+  )
+  const workers = Array.from(
+    new Set(chunks.map((chunk) => chunk.worker_name_snapshot).filter((name): name is string => Boolean(name)))
+  ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }))
+
+  return (
+    <div className="space-y-2">
+      <div className="flex h-8 overflow-hidden rounded-md border bg-muted">
+        {chunks.map((chunk) => {
+          const seconds = Math.max(chunkCoreSeconds(chunk), 0.1)
+          const basis = `${Math.max(4, (seconds / totalSeconds) * 100)}%`
+          const status = chunk.status === "succeeded" ? "done" : chunk.status
+          const label = `${chunk.index + 1}. ${chunkWorkerLabel(chunk)}`
+          return (
+            <div
+              key={chunk.id}
+              className="relative min-w-8 border-r border-background/70 last:border-r-0"
+              style={{ flexBasis: basis, flexGrow: seconds }}
+              title={`Chunk ${chunk.index + 1}: ${chunkWorkerLabel(chunk)} · ${status} · ${formatDuration(seconds)}`}
+            >
+              <div
+                className={`absolute inset-y-0 left-0 ${chunkStatusClass(chunk, colorMap)} transition-all`}
+                style={{ width: `${chunkProgress(chunk)}%` }}
+              />
+              <div className="relative flex h-full items-center justify-center px-1 text-[11px] font-medium text-white">
+                <span className="truncate drop-shadow-sm">{label}</span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+        {workers.length === 0 ? (
+          <span>Chunks are waiting for workers.</span>
+        ) : (
+          workers.map((worker) => (
+            <span key={worker} className="inline-flex items-center gap-1 rounded-md border bg-muted/30 px-2 py-1">
+              <span className={`h-2 w-2 rounded-full ${workerColor(worker, colorMap)}`} />
+              {worker}
+            </span>
+          ))
+        )}
+        {chunks.some((chunk) => chunk.status === "failed") && (
+          <span className="inline-flex items-center gap-1 rounded-md border bg-muted/30 px-2 py-1">
+            <span className="h-2 w-2 rounded-full bg-destructive" />
+            failed
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function SplitProcessedProgress({ job }: { job: TranscriptionJob }) {
+  const chunks = [...(job.split_chunks ?? [])].sort((a, b) => a.index - b.index)
+  if (!job.split_enabled || chunks.length === 0) return null
+
+  const colorMap = workerColorMap(chunks)
+  const totalSeconds = Math.max(
+    job.audio_file?.duration_seconds ?? chunks.reduce((sum, chunk) => sum + chunkCoreSeconds(chunk), 0),
+    1
+  )
+  const processedByWorker = new Map<string, number>()
+  for (const chunk of chunks) {
+    const worker = chunk.worker_name_snapshot ?? "Unassigned"
+    const processedSeconds = chunkCoreSeconds(chunk) * (chunkProgress(chunk) / 100)
+    processedByWorker.set(worker, (processedByWorker.get(worker) ?? 0) + processedSeconds)
+  }
+  const segments = Array.from(processedByWorker.entries())
+    .map(([worker, seconds]) => ({ worker, seconds, percent: (seconds / totalSeconds) * 100 }))
+    .filter((segment) => segment.seconds > 0)
+    .sort((a, b) => a.worker.localeCompare(b.worker, undefined, { sensitivity: "base", numeric: true }))
+  const processedPercent = Math.min(100, segments.reduce((sum, segment) => sum + segment.percent, 0))
+
+  return (
+    <div className="space-y-2">
+      <div className="flex h-3 overflow-hidden rounded-full bg-muted">
+        {segments.map((segment) => (
+          <div
+            key={segment.worker}
+            className={`${workerColor(segment.worker === "Unassigned" ? null : segment.worker, colorMap)} h-full transition-all`}
+            style={{ width: `${Math.max(segment.percent, 0.75)}%` }}
+            title={`${segment.worker}: ${formatDuration(segment.seconds)} processed (${Math.round(segment.percent)}% of audio)`}
+          />
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+        <span>{Math.round(processedPercent)}% processed</span>
+        {segments.map((segment) => (
+          <span key={segment.worker} className="inline-flex items-center gap-1">
+            <span className={`h-2 w-2 rounded-full ${workerColor(segment.worker === "Unassigned" ? null : segment.worker, colorMap)}`} />
+            {segment.worker}: {Math.round(segment.percent)}%
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
 
 export default function Jobs() {
   const qc = useQueryClient()
@@ -154,6 +312,8 @@ export default function Jobs() {
             const expanded = expandedId === job.id
             const progress = jobProgress(job)
             const eta = jobEta(job, jobs)
+            const runningWorkers = job.running_worker_names ?? []
+            const runningWorkerLabel = runningWorkers.length > 0 ? runningWorkers.join(", ") : null
 
             return (
               <Card key={job.id} className={expanded ? "border-primary" : ""}>
@@ -173,7 +333,15 @@ export default function Jobs() {
                         <span className="truncate text-sm font-medium">{audioTitle(job.audio_file, `Job #${job.id}`)}</span>
                       </div>
                       <p className="mt-1 truncate text-xs text-muted-foreground">
-                        {job.model?.display_name ?? job.model?.variant ?? "model"} · {job.language} · {formatDateTimeLocal(job.created_at)}
+                        {job.model?.display_name ?? job.model?.variant ?? "model"} · {job.language} ·{" "}
+                        {runningWorkerLabel
+                          ? `running on ${runningWorkerLabel}`
+                          : job.split_enabled
+                            ? "split job"
+                            : job.worker_name_snapshot
+                              ? `worker ${job.worker_name_snapshot}`
+                              : `target ${job.preferred_worker_name_snapshot ?? "any worker"}`} ·{" "}
+                        {formatDateTimeLocal(job.created_at)}
                       </p>
                       {job.status_text && (
                         <p
@@ -199,14 +367,30 @@ export default function Jobs() {
                       <span className="text-muted-foreground">Audio </span>
                       <span className="font-medium">{formatDuration(job.audio_file?.duration_seconds)}</span>
                     </span>
+                    {runningWorkerLabel && (
+                      <span className="rounded-md bg-muted/40 px-2 py-1 text-xs">
+                        <span className="text-muted-foreground">Running on </span>
+                        <span className="font-medium">{runningWorkerLabel}</span>
+                      </span>
+                    )}
                   </div>
                 </button>
 
-                {progress !== null && (
+                {job.split_enabled ? (
+                  <div className="px-4 pb-4">
+                    <SplitProcessedProgress job={job} />
+                  </div>
+                ) : progress !== null && (
                   <div className="px-4 pb-4">
                     <div className="h-2 overflow-hidden rounded-full bg-muted">
                       <div className="h-full bg-primary transition-all" style={{ width: `${progress}%` }} />
                     </div>
+                  </div>
+                )}
+
+                {job.split_enabled && (
+                  <div className="px-4 pb-4">
+                    <SplitChunkTimeline job={job} />
                   </div>
                 )}
 
@@ -226,6 +410,19 @@ export default function Jobs() {
                       <MetadataItem label="Progress" value={progress !== null ? `${progress}%` : "-"} />
                       <MetadataItem label="Est. Remaining" value={eta ?? "-"} />
                       <MetadataItem label="Queue Wait" value={queueWait(job)} />
+                      <MetadataItem label="Worker" value={job.worker_name_snapshot ?? (job.split_enabled ? "Multiple workers" : "Not assigned")} />
+                      <MetadataItem
+                        label="Running On"
+                        value={runningWorkerLabel ?? (job.status === "running" ? "Assigning worker" : "-")}
+                      />
+                      <MetadataItem label="Target Worker" value={job.preferred_worker_name_snapshot ?? "Any accepted worker"} />
+                      <MetadataItem label="Split" value={job.split_enabled ? `${job.split_chunks_completed}/${job.split_chunk_count} chunks done` : "Off"} />
+                      {job.split_enabled && (
+                        <MetadataItem
+                          label="Chunks"
+                          value={`${job.split_chunks_running} running · ${job.split_chunks_queued} queued · ${job.split_chunks_failed} failed${runningWorkerLabel ? ` · ${runningWorkerLabel}` : ""}`}
+                        />
+                      )}
                       <MetadataItem
                         label="Model"
                         value={
@@ -262,6 +459,18 @@ export default function Jobs() {
                     {job.error_message && (
                       <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
                         {job.error_message}
+                      </div>
+                    )}
+
+                    {job.partial_transcript_text && (
+                      <div className="space-y-2">
+                        <div>
+                          <h3 className="text-sm font-semibold">Partial transcript</h3>
+                          <p className="text-xs text-muted-foreground">
+                            Updated {job.partial_updated_at ? formatDateTimeLocal(job.partial_updated_at) : "while running"}
+                          </p>
+                        </div>
+                        <TranscriptAudioPlayer job={job} source="partial" title="Partial transcript" />
                       </div>
                     )}
 

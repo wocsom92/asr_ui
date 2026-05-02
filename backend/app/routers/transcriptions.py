@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,8 @@ from app.models.user import User
 from app.schemas.transcription import TranscriptionJobOut, TranscriptionSegmentOut
 from app.services.job_cancellation import signal_job_cancel
 from app.services.transcription_files import delete_transcription_outputs
+from app.models.transcription_job_chunk import TranscriptionJobChunk
+from app.services.worker_runtime import try_merge_split_job
 
 router = APIRouter(prefix="/api/v1/transcriptions", tags=["transcriptions"])
 
@@ -60,18 +64,7 @@ def _segment_seconds(segment: dict[str, Any], key: str) -> float | None:
     return None
 
 
-def _read_transcription_segments(job: TranscriptionJob) -> list[TranscriptionSegmentOut]:
-    if not job.output_json_path:
-        return []
-    path = Path(job.output_json_path)
-    if not path.exists():
-        return []
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return []
-
+def _segments_from_data(data: Any) -> list[TranscriptionSegmentOut]:
     raw_segments = data.get("transcription") if isinstance(data, dict) else None
     if not isinstance(raw_segments, list):
         return []
@@ -89,6 +82,45 @@ def _read_transcription_segments(job: TranscriptionJob) -> list[TranscriptionSeg
     return segments
 
 
+def _read_final_transcription_segments(job: TranscriptionJob) -> list[TranscriptionSegmentOut]:
+    if not job.output_json_path:
+        return []
+    path = Path(job.output_json_path)
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return []
+    return _segments_from_data(data)
+
+
+def _read_partial_transcription_segments(job: TranscriptionJob) -> list[TranscriptionSegmentOut]:
+    if not job.partial_transcript_json:
+        return []
+    try:
+        data = json.loads(job.partial_transcript_json)
+    except json.JSONDecodeError:
+        return []
+    return _segments_from_data(data)
+
+
+def _read_transcription_segments(
+    job: TranscriptionJob,
+    source: str,
+) -> list[TranscriptionSegmentOut]:
+    if source == "partial":
+        return _read_partial_transcription_segments(job)
+    if source == "final":
+        return _read_final_transcription_segments(job)
+    if job.status == "succeeded":
+        final = _read_final_transcription_segments(job)
+        if final:
+            return final
+    return _read_partial_transcription_segments(job)
+
+
 def _job_query(user_id: int):
     return (
         select(TranscriptionJob)
@@ -96,6 +128,7 @@ def _job_query(user_id: int):
             selectinload(TranscriptionJob.audio_file),
             selectinload(TranscriptionJob.audio_file).selectinload(AudioFile.project),
             selectinload(TranscriptionJob.model),
+            selectinload(TranscriptionJob.chunks),
         )
         .where(TranscriptionJob.owner_user_id == user_id)
     )
@@ -154,6 +187,21 @@ async def cancel_transcription(
         raise HTTPException(status_code=404, detail="Transcription not found")
 
     if job.status == "queued":
+        now = datetime.now(timezone.utc)
+        if job.split_enabled:
+            await db.execute(
+                update(TranscriptionJobChunk)
+                .where(
+                    TranscriptionJobChunk.parent_job_id == job_id,
+                    TranscriptionJobChunk.status == "queued",
+                )
+                .values(
+                    status="cancelled",
+                    status_text="Cancelled",
+                    finished_at=now,
+                    error_message=None,
+                )
+            )
         res = await db.execute(
             update(TranscriptionJob)
             .where(
@@ -164,8 +212,10 @@ async def cancel_transcription(
             .values(
                 status="cancelled",
                 status_text="Cancelled",
-                finished_at=datetime.now(timezone.utc),
+                finished_at=now,
                 error_message=None,
+                cancel_requested_at=now,
+                split_status="cancelled" if job.split_enabled else job.split_status,
             )
         )
         await db.commit()
@@ -175,6 +225,21 @@ async def cancel_transcription(
                 detail="Job is no longer queued; refresh and try again.",
             )
     elif job.status == "running":
+        now = datetime.now(timezone.utc)
+        if job.split_enabled:
+            await db.execute(
+                update(TranscriptionJobChunk)
+                .where(
+                    TranscriptionJobChunk.parent_job_id == job_id,
+                    TranscriptionJobChunk.status == "queued",
+                )
+                .values(
+                    status="cancelled",
+                    status_text="Cancelled",
+                    finished_at=now,
+                    error_message=None,
+                )
+            )
         await db.execute(
             update(TranscriptionJob)
             .where(
@@ -182,10 +247,16 @@ async def cancel_transcription(
                 TranscriptionJob.owner_user_id == user.id,
                 TranscriptionJob.status == "running",
             )
-            .values(status_text="Cancelling…")
+            .values(
+                status_text="Cancelling…",
+                split_status="running" if job.split_enabled else job.split_status,
+                cancel_requested_at=now,
+            )
         )
         await db.commit()
         await signal_job_cancel(job_id)
+        if job.split_enabled:
+            await try_merge_split_job(db, job_id)
     else:
         raise HTTPException(
             status_code=400,
@@ -198,6 +269,7 @@ async def cancel_transcription(
             selectinload(TranscriptionJob.audio_file),
             selectinload(TranscriptionJob.audio_file).selectinload(AudioFile.project),
             selectinload(TranscriptionJob.model),
+            selectinload(TranscriptionJob.chunks),
         )
         .where(TranscriptionJob.id == job_id, TranscriptionJob.owner_user_id == user.id)
     )
@@ -230,6 +302,7 @@ async def delete_transcription(
 @router.get("/{job_id}/segments", response_model=list[TranscriptionSegmentOut])
 async def get_transcription_segments(
     job_id: int,
+    source: str = Query("auto", pattern="^(auto|partial|final)$"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -237,9 +310,9 @@ async def get_transcription_segments(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Transcription not found")
-    if job.status != "succeeded":
+    if source == "final" and job.status != "succeeded":
         raise HTTPException(status_code=409, detail="Transcription is not finished")
-    return _read_transcription_segments(job)
+    return _read_transcription_segments(job, source)
 
 
 @router.get("/{job_id}/download")

@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query"
-import { AudioLines, Cpu, FileAudio, Loader2 } from "lucide-react"
+import { AudioLines, Cpu, FileAudio, Loader2, ServerCog } from "lucide-react"
 import { Link } from "react-router-dom"
 import api from "@/api/client"
-import type { AudioFile, TranscriptionJob, TranscriptionModel } from "@/types"
+import type { AudioFile, TranscriptionJob, TranscriptionModel, TranscriptionWorker } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { formatDateTimeLocal } from "@/lib/datetime"
@@ -28,6 +28,12 @@ export default function Dashboard() {
     enabled: user?.role === "admin",
     refetchInterval: 10000,
   })
+  const { data: workers = [] } = useQuery<TranscriptionWorker[]>({
+    queryKey: ["workers"],
+    queryFn: () => api.get("/workers").then((r) => r.data),
+    enabled: user?.role === "admin",
+    refetchInterval: 5000,
+  })
 
   const storage = files.reduce((sum, file) => sum + file.size_bytes, 0)
   const audioDuration = files.reduce((sum, file) => sum + (file.duration_seconds ?? 0), 0)
@@ -42,6 +48,13 @@ export default function Dashboard() {
     0
   )
   const recent = jobs.slice(0, 8)
+  const onlineWorkerList = workers.filter((worker) => worker.online)
+  const availableWorkers = onlineWorkerList.filter(
+    (worker) => worker.accepted && worker.current_job_count === 0 && worker.status === "idle"
+  )
+  const workerNames = availableWorkers
+    .map((worker) => worker.display_name || worker.name)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }))
 
   return (
     <div className="space-y-6">
@@ -55,7 +68,7 @@ export default function Dashboard() {
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
           <Card>
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle className="text-sm font-medium">Audio Files</CardTitle>
@@ -87,20 +100,39 @@ export default function Dashboard() {
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">{jobs.filter((j) => ["queued", "running"].includes(j.status)).length}</div>
-              <p className="text-xs text-muted-foreground">single Pi worker</p>
+              <p className="text-xs text-muted-foreground">
+                worker queue
+              </p>
             </CardContent>
           </Card>
           {user?.role === "admin" && (
-            <Card>
-              <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="text-sm font-medium">Models</CardTitle>
-                <Cpu className="h-4 w-4 text-muted-foreground" />
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold">{models.filter((m) => m.status === "installed").length}</div>
-                <p className="text-xs text-muted-foreground">installed Whisper variants</p>
-              </CardContent>
-            </Card>
+            <>
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">Available Workers</CardTitle>
+                  <ServerCog className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">{availableWorkers.length}</div>
+                  <p className="text-xs text-muted-foreground">
+                    {onlineWorkerList.length} online · {workers.length} registered
+                  </p>
+                  <p className="mt-2 truncate text-xs font-medium">
+                    {workerNames.length > 0 ? workerNames.join(", ") : "No idle workers"}
+                  </p>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">Models</CardTitle>
+                  <Cpu className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">{models.filter((m) => m.status === "installed").length}</div>
+                  <p className="text-xs text-muted-foreground">installed Whisper variants</p>
+                </CardContent>
+              </Card>
+            </>
           )}
         </div>
       )}

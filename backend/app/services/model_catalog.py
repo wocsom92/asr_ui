@@ -1,10 +1,36 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from app.config import settings
 from app.schemas.models import ModelCatalogItem
 
 
 def model_url(variant: str) -> str:
     return f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{variant}.bin"
+
+
+GIGAAM_REPO_ID = "ai-sage/GigaAM-v3"
+GIGAAM_REVISIONS = {
+    "gigaam-v3-ctc": "ctc",
+    "gigaam-v3-rnnt": "rnnt",
+    "gigaam-v3-e2e-ctc": "e2e_ctc",
+    "gigaam-v3-e2e-rnnt": "e2e_rnnt",
+}
+
+
+def gigaam_url(revision: str) -> str:
+    return f"https://huggingface.co/{GIGAAM_REPO_ID}/tree/{revision}"
+
+
+def model_storage_path(variant: str) -> Path:
+    if variant in GIGAAM_REVISIONS:
+        return settings.models_dir / variant
+    return settings.models_dir / f"ggml-{variant}.bin"
+
+
+def gigaam_revision(variant: str) -> str | None:
+    return GIGAAM_REVISIONS.get(variant)
 
 
 MODEL_CATALOG: list[ModelCatalogItem] = [
@@ -157,6 +183,42 @@ MODEL_CATALOG: list[ModelCatalogItem] = [
         ram_hint="~2.1 GB",
         download_url=model_url("large-v3-turbo"),
         model_variant="large-v3-turbo",
+    ),
+    ModelCatalogItem(
+        provider="gigaam",
+        variant="gigaam-v3-ctc",
+        display_name="GigaAM v3 CTC",
+        language_mode="russian",
+        disk_hint="Hugging Face snapshot",
+        ram_hint="GPU or high-RAM CPU recommended",
+        download_url=gigaam_url("ctc"),
+    ),
+    ModelCatalogItem(
+        provider="gigaam",
+        variant="gigaam-v3-rnnt",
+        display_name="GigaAM v3 RNN-T",
+        language_mode="russian",
+        disk_hint="Hugging Face snapshot",
+        ram_hint="GPU or high-RAM CPU recommended",
+        download_url=gigaam_url("rnnt"),
+    ),
+    ModelCatalogItem(
+        provider="gigaam",
+        variant="gigaam-v3-e2e-ctc",
+        display_name="GigaAM v3 E2E CTC",
+        language_mode="russian",
+        disk_hint="Hugging Face snapshot",
+        ram_hint="GPU or high-RAM CPU recommended",
+        download_url=gigaam_url("e2e_ctc"),
+    ),
+    ModelCatalogItem(
+        provider="gigaam",
+        variant="gigaam-v3-e2e-rnnt",
+        display_name="GigaAM v3 E2E RNN-T",
+        language_mode="russian",
+        disk_hint="Hugging Face snapshot",
+        ram_hint="GPU or high-RAM CPU recommended",
+        download_url=gigaam_url("e2e_rnnt"),
     ),
 ]
 

@@ -1,23 +1,24 @@
 # ASR UI
 
-ASR UI is a self-hosted transcription web app built around `whisper.cpp`. It provides private audio uploads, per-user transcription jobs, local Whisper model management, transcript review, and transcript downloads.
+ASR UI is a self-hosted transcription web app built around local ASR models. It provides private audio uploads, per-user transcription jobs, local Whisper/GigaAM model management, transcript review, and transcript downloads.
 
-Version: `1.0.0`
+Version: `1.1.2`
 
 ## Features
 
 - First-user admin setup with JWT cookie authentication.
 - Per-user audio file isolation and admin user management.
 - Uploads for common audio formats with duration probing through `ffmpeg`.
-- Whisper model catalog, install, cancel, and remove flows.
+- Whisper and GigaAM model catalog, install, cancel, and remove flows.
 - Transcription queue with progress, cancellation, transcript cleanup, and download outputs.
+- Worker scheduling uses per-model speed history so split jobs account for how fast each worker is with the selected ASR model.
 - Responsive React interface for desktop and mobile use.
 
 ## Stack
 
 - Frontend: React, Vite, TypeScript, Tailwind, shadcn-style UI primitives.
 - Backend: FastAPI, async SQLAlchemy, SQLite, JWT cookies.
-- Transcription: `ffmpeg` audio conversion and `whisper.cpp` GGML models.
+- Transcription: `ffmpeg` audio conversion, `whisper.cpp` GGML models, and GigaAM v3 Hugging Face snapshots.
 - Deployment: Docker Compose with frontend on `8824` and backend on `8825` by default.
 
 ## Quick Start
@@ -27,7 +28,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://localhost:8824`, create the first admin account, install a Whisper model from the Models page, upload audio, and queue a transcription job.
+Open `http://localhost:8824`, create the first admin account, install a model from the Models page, upload audio, and queue a transcription job.
 
 ## Configuration
 
@@ -41,6 +42,10 @@ Useful settings:
 - `WHISPER_MAX_CONTEXT`: max previous text tokens passed between windows. The default `0` prevents hallucinations from repeating through a long file.
 - `WHISPER_USE_GPU` and `WHISPER_FLASH_ATTN`: disabled by default for CPU-only Docker reliability.
 - `TRANSCRIPT_FILTER_REGEX`: optional regex removed from generated transcript text. Leave it empty to disable cleanup.
+- `GIGAAM_CHUNK_MAX_SECONDS`: hard maximum WAV chunk length passed to GigaAM. Default `24.0`.
+- `GIGAAM_CHUNK_TARGET_SECONDS` and `GIGAAM_CHUNK_OVERLAP_SECONDS`: speech-aware chunk core target and local context overlap. Defaults `22.0` and `1.0`.
+- `GIGAAM_VAD_ENABLED`, `GIGAAM_VAD_MODE`, `GIGAAM_VAD_MERGE_SILENCE_MS`, and `GIGAAM_VAD_PAD_MS`: local WebRTC VAD settings used to prefer silence/low-energy GigaAM chunk boundaries.
+- `GIGAAM_TORCH_THREADS` and `GIGAAM_TORCH_INTEROP_THREADS`: PyTorch CPU thread limits for GigaAM inference. Raspberry Pi 5 deploys use `3` and `1`; the MacBook worker target uses `4` and `1`.
 
 ## Deploy
 
@@ -51,6 +56,46 @@ scripts/deploy.sh --target raspi5
 ```
 
 The backend container builds `whisper.cpp` and includes `ffmpeg`. Model files are stored in the `model_data` Docker volume. Uploads, transcripts, and SQLite data live in `db_data`.
+
+## GigaAM v3
+
+GigaAM v3 models are available from the Models page alongside Whisper models. The app supports the CTC, RNN-T, E2E CTC, and E2E RNN-T variants from `ai-sage/GigaAM-v3`.
+
+GigaAM runs through Hugging Face `transformers` with remote model code and downloads model snapshots into `/models`. Rebuild the backend and worker images after updating so the added ML dependencies are installed. GigaAM models are Russian-only in the app.
+
+The app does not call GigaAM's pyannote-based `transcribe_longform` path, so transcription does not require an `HF_TOKEN`. Audio longer than GigaAM's short-form limit is split locally and transcribed with the regular local `transcribe` method.
+
+GigaAM chunking is separate from distributed split jobs. Before GigaAM inference, the worker converts the input to 16 kHz mono PCM WAV with `ffmpeg`. If the WAV is longer than `GIGAAM_CHUNK_MAX_SECONDS`, the worker writes local WAV chunks under the transcript output directory in `gigaam_chunks/`, runs `transcribe()` on each chunk, then merges the chunk texts into normal TXT, JSON, SRT, and VTT outputs.
+
+By default, GigaAM chunking uses local WebRTC VAD to prefer silence or low-energy cut points near a 22-second core target. Each chunk can include up to 1 second of local overlap/context, but the actual WAV sent to GigaAM never exceeds the 24-second hard maximum. Final timestamps use the non-overlap core range, and repeated words at chunk joins are deduplicated. If VAD is disabled, unavailable, or finds no speech, the worker falls back to fixed 24-second chunks. This avoids GigaAM's "Too long wav file, use transcribe_longform" error while staying tokenless and fully local.
+
+The practical limit is time-based: 24 seconds per GigaAM WAV chunk by default. It is not a fixed 24 MB upload limit; the byte size of a 24-second WAV depends on the converted sample rate, sample width, and channel count.
+
+GigaAM inference runs through PyTorch. Set `GIGAAM_TORCH_THREADS` to cap the number of intra-op CPU threads used by PyTorch and `GIGAAM_TORCH_INTEROP_THREADS` to cap inter-op scheduling threads. These settings are applied before the GigaAM model is loaded in each backend or worker process. `scripts/deploy.targets.env` sets `3/1` for `raspi5` and `4/1` for `macbook_worker`.
+
+## Remote Workers
+
+The Raspberry Pi backend can keep its local worker enabled with `ASR_WORKER_ENABLED=true`.
+Keep `ASR_WORKER_NAME` stable across redeploys, for example `raspi5`, so the same worker
+database row and id are reused.
+To run a worker on another machine, point it at the Pi backend and use the same
+`ASR_WORKER_TOKEN`:
+
+```bash
+ASR_WORKER_NAME=macbook \
+ASR_SERVER_URL=http://raspi5.local:8825 \
+ASR_WORKER_TOKEN=change-me-worker-token \
+docker compose --profile worker up --build worker
+```
+
+Remote workers install missing Whisper or GigaAM models into their local `/models` volume automatically.
+Use `ASR_WORKER_NAME` for the stable worker identity; admins can set a friendlier display
+name from the Workers page. New remote workers appear as pending on the Workers page and
+must be accepted before they can install models or claim jobs. Removed workers are hidden;
+if a removed worker starts heartbeating again with the same `ASR_WORKER_NAME`, it reappears
+as pending.
+Split transcription is optional per job from the Run transcription dialog.
+Split chunks are sized from each selected worker's measured speed for the chosen model variant. If exact job history for that model is not available yet, the scheduler uses the worker's persisted per-model speed samples instead of mixing speeds from unrelated models.
 
 ## Development
 

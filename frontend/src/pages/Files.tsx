@@ -4,7 +4,8 @@ import { FileAudio, Loader2, Pencil, Play, Trash2, Upload } from "lucide-react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
 import api from "@/api/client"
-import type { AudioFile, Project, TranscriptionJob, TranscriptionModel } from "@/types"
+import { ProjectBadge } from "@/components/ProjectBadge"
+import type { AudioFile, Project, TranscriptionJob, TranscriptionModel, TranscriptionWorker } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -18,6 +19,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
+import { Switch } from "@/components/ui/switch"
 import {
   Select,
   SelectContent,
@@ -52,6 +54,14 @@ function AudioPreview({ file }: { file: AudioFile }) {
   )
 }
 
+function InputSourceBadge({ source }: { source?: string | null }) {
+  const normalized = source || "web"
+  if (normalized === "telegram") {
+    return <Badge variant="outline">Telegram</Badge>
+  }
+  return <Badge variant="secondary">Web UI</Badge>
+}
+
 export default function Files() {
   const qc = useQueryClient()
   const [selectedFile, setSelectedFile] = useState<AudioFile | null>(null)
@@ -62,6 +72,9 @@ export default function Files() {
   const [projectFilter, setProjectFilter] = useState("all")
   const [modelId, setModelId] = useState("")
   const [language, setLanguage] = useState("auto")
+  const [splitEnabled, setSplitEnabled] = useState(false)
+  const [preferredWorkerId, setPreferredWorkerId] = useState("auto")
+  const [splitWorkerIds, setSplitWorkerIds] = useState<number[]>([])
   const [uploadProgress, setUploadProgress] = useState<{
     filename: string
     loaded: number
@@ -99,8 +112,15 @@ export default function Files() {
         ? 1000
         : 5000,
   })
+  const { data: workers = [] } = useQuery<TranscriptionWorker[]>({
+    queryKey: ["workers", "accepted"],
+    queryFn: () => api.get("/workers").then((r) => r.data),
+    retry: false,
+    refetchInterval: 5000,
+  })
   const installedModels = allModels.filter((m) => m.status === "installed")
   const installingModels = allModels.filter((m) => m.status === "installing")
+  const acceptedWorkers = workers.filter((worker) => worker.accepted && !worker.is_deleted)
   const finishedJobsByFile = useMemo(() => {
     const grouped = new Map<number, TranscriptionJob[]>()
     jobs
@@ -185,6 +205,9 @@ export default function Files() {
       api.post(`/files/${selectedFile?.id}/transcriptions`, {
         model_id: Number(modelId),
         language,
+        split_enabled: splitEnabled,
+        preferred_worker_id: splitEnabled || preferredWorkerId === "auto" ? null : Number(preferredWorkerId),
+        split_worker_ids: splitEnabled ? splitWorkerIds : [],
       }),
     onSuccess: () => {
       setSelectedFile(null)
@@ -209,6 +232,17 @@ export default function Files() {
     setSelectedFile(file)
     setModelId("")
     setLanguage("auto")
+    setSplitEnabled(false)
+    const raspiWorker = acceptedWorkers.find((worker) => worker.name === "raspi5")
+    setPreferredWorkerId(raspiWorker ? String(raspiWorker.id) : "auto")
+    const defaultSplitWorkers = [
+      ...(raspiWorker ? [raspiWorker.id] : []),
+      ...acceptedWorkers
+        .filter((worker) => worker.id !== raspiWorker?.id)
+        .slice(0, 1)
+        .map((worker) => worker.id),
+    ]
+    setSplitWorkerIds(defaultSplitWorkers)
   }
 
   const openEditDialog = (file: AudioFile) => {
@@ -217,12 +251,6 @@ export default function Files() {
     setEditNotes(file.notes || "")
     setEditProjectId(file.project_id ? String(file.project_id) : "none")
   }
-
-  const ProjectBadge = ({ file }: { file: AudioFile }) => (
-    <Badge variant={file.project ? "secondary" : "outline"} className="mt-2">
-      {file.project?.name ?? "Unassigned"}
-    </Badge>
-  )
 
   const handleModelChange = (value: string) => {
     setModelId(value)
@@ -233,6 +261,14 @@ export default function Files() {
         : model?.language_mode === "russian"
           ? "ru"
           : "auto"
+    )
+  }
+
+  const toggleSplitWorker = (workerId: number) => {
+    setSplitWorkerIds((current) =>
+      current.includes(workerId)
+        ? current.filter((id) => id !== workerId)
+        : [...current, workerId]
     )
   }
 
@@ -374,7 +410,12 @@ export default function Files() {
                       <p className="truncate font-medium">{file.display_name || file.original_filename}</p>
                       <p className="truncate text-xs text-muted-foreground">{file.original_filename}</p>
                       {file.notes && <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{file.notes}</p>}
-                      <ProjectBadge file={file} />
+                      <div className="mt-2">
+                        <div className="flex flex-wrap gap-2">
+                          <InputSourceBadge source={file.source} />
+                          <ProjectBadge project={file.project} />
+                        </div>
+                      </div>
                       <TranscriptionLabels file={file} />
                     </td>
                     <td className="w-[280px] p-3">
@@ -414,9 +455,8 @@ export default function Files() {
                   <div className="flex flex-wrap gap-2">
                     <Badge variant="secondary">{formatDuration(file.duration_seconds)}</Badge>
                     <Badge variant="outline">{formatBytes(file.size_bytes)}</Badge>
-                    <Badge variant={file.project ? "secondary" : "outline"}>
-                      {file.project?.name ?? "Unassigned"}
-                    </Badge>
+                    <InputSourceBadge source={file.source} />
+                    <ProjectBadge project={file.project} />
                   </div>
                   <TranscriptionLabels file={file} />
                   <AudioPreview file={file} />
@@ -499,9 +539,71 @@ export default function Files() {
                 </SelectContent>
               </Select>
             </div>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div>
+                <Label htmlFor="split-transcription">Split across workers</Label>
+                <p className="text-xs text-muted-foreground">
+                  Optional for long recordings. Normal single-worker mode remains the default.
+                </p>
+              </div>
+              <Switch
+                id="split-transcription"
+                checked={splitEnabled}
+                onCheckedChange={setSplitEnabled}
+              />
+            </div>
+            {splitEnabled ? (
+              <div className="space-y-2">
+                <Label>Splitter workers</Label>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {acceptedWorkers.map((worker) => {
+                    const checked = splitWorkerIds.includes(worker.id)
+                    return (
+                      <Button
+                        key={worker.id}
+                        type="button"
+                        variant={checked ? "default" : "outline"}
+                        className="justify-start"
+                        onClick={() => toggleSplitWorker(worker.id)}
+                      >
+                        {worker.display_name || worker.name}
+                        {worker.name === "raspi5" ? " (default)" : ""}
+                      </Button>
+                    )
+                  })}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Chunks will only be claimed by selected splitter workers. Choose at least two.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <Label>Worker</Label>
+                <Select value={preferredWorkerId} onValueChange={setPreferredWorkerId}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Any accepted worker</SelectItem>
+                    {acceptedWorkers.map((worker) => (
+                      <SelectItem key={worker.id} value={String(worker.id)}>
+                        {worker.display_name || worker.name}
+                        {worker.name === "raspi5" ? " (default)" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  The selected worker will be the only worker allowed to claim this job.
+                </p>
+              </div>
+            )}
           </div>
           <DialogFooter>
-            <Button onClick={() => startMutation.mutate()} disabled={!modelId || startMutation.isPending}>
+            <Button
+              onClick={() => startMutation.mutate()}
+              disabled={!modelId || startMutation.isPending || (splitEnabled && splitWorkerIds.length < 2)}
+            >
               {startMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Queue Job
             </Button>

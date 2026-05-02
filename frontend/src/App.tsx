@@ -9,9 +9,11 @@ import Files from "@/pages/Files"
 import Jobs from "@/pages/Jobs"
 import Login from "@/pages/Login"
 import Models from "@/pages/Models"
+import Projects from "@/pages/Projects"
 import Settings from "@/pages/Settings"
 import Transcriptions from "@/pages/Transcriptions"
 import UserManagement from "@/pages/UserManagement"
+import Workers from "@/pages/Workers"
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
@@ -37,8 +39,10 @@ export default function App() {
               <Route path="/files" element={<Files />} />
               <Route path="/jobs" element={<Jobs />} />
               <Route path="/transcriptions" element={<Transcriptions />} />
+              <Route path="/projects" element={<Projects />} />
               <Route path="/models" element={<Models />} />
               <Route path="/users" element={<UserManagement />} />
+              <Route path="/workers" element={<Workers />} />
               <Route path="/settings" element={<Settings />} />
             </Route>
           </Routes>
