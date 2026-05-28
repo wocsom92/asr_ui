@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { ChevronDown, ChevronRight, FileText, Loader2, Trash2 } from "lucide-react"
+import { Ban, Brain, ChevronDown, ChevronRight, Copy, FileText, Loader2, Trash2 } from "lucide-react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
 
@@ -30,6 +30,8 @@ import {
   MetadataItem,
   queueWait,
   statusIcon,
+  summaryQueueWait,
+  summaryRuntime,
 } from "@/lib/jobs"
 import type { TranscriptionJob, TranscriptionJobChunk } from "@/types"
 
@@ -44,6 +46,24 @@ const WORKER_COLORS = [
   "bg-lime-700",
   "bg-indigo-600",
 ]
+
+type SummaryJobStatus = Exclude<TranscriptionJob["summary_status"], "idle">
+
+type JobListItem =
+  | { kind: "transcription"; id: string; status: TranscriptionJob["status"]; job: TranscriptionJob; sortAt: string }
+  | { kind: "summary"; id: string; status: SummaryJobStatus; job: TranscriptionJob; sortAt: string }
+
+function summarySortDate(job: TranscriptionJob) {
+  return job.summary_queued_at ?? job.summary_started_at ?? job.summary_updated_at ?? job.created_at
+}
+
+function summaryStatusBadgeClass(status: SummaryJobStatus) {
+  if (status === "succeeded") return "border-emerald-300 bg-emerald-50 text-emerald-800"
+  if (status === "failed") return "border-destructive/40 bg-destructive/10 text-destructive"
+  if (status === "cancelled") return "border-gray-300 bg-gray-200 text-gray-800 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-200"
+  if (status === "running") return "border-blue-300 bg-blue-50 text-blue-800"
+  return "border-amber-300 bg-amber-50 text-amber-800"
+}
 
 function chunkCoreSeconds(chunk: TranscriptionJobChunk) {
   return Math.max(
@@ -194,7 +214,7 @@ function SplitProcessedProgress({ job }: { job: TranscriptionJob }) {
 
 export default function Jobs() {
   const qc = useQueryClient()
-  const [expandedId, setExpandedId] = useState<number | null>(null)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState("all")
   const [page, setPage] = useState(1)
   const { data: jobs = [], isLoading } = useQuery<TranscriptionJob[]>({
@@ -202,7 +222,14 @@ export default function Jobs() {
     queryFn: () => api.get("/transcriptions").then((r) => r.data),
     refetchInterval: (query) => {
       const list = query.state.data
-      return list?.some((j) => j.status === "queued" || j.status === "running" || isJobCancelling(j))
+      return list?.some(
+        (j) =>
+          j.status === "queued" ||
+          j.status === "running" ||
+          isJobCancelling(j) ||
+          j.summary_status === "queued" ||
+          j.summary_status === "running"
+      )
         ? 1500
         : 5000
     },
@@ -231,7 +258,7 @@ export default function Jobs() {
       qc.setQueryData<TranscriptionJob[]>(["transcriptions"], (prev) =>
         prev ? prev.filter((job) => job.id !== jobId) : prev
       )
-      if (expandedId === jobId) setExpandedId(null)
+      if (expandedId === `transcription-${jobId}` || expandedId === `summary-${jobId}`) setExpandedId(null)
       void qc.invalidateQueries({ queryKey: ["transcriptions"] })
       toast.success("Transcription and output files deleted")
     },
@@ -241,14 +268,62 @@ export default function Jobs() {
     },
   })
 
-  const filteredJobs = useMemo(() => {
-    if (statusFilter === "all") return jobs
-    if (statusFilter === "running") return jobs.filter((job) => job.status === "running")
-    return jobs.filter((job) => job.status === statusFilter)
-  }, [jobs, statusFilter])
+  const summaryMutation = useMutation({
+    mutationFn: (jobId: number) => api.post<TranscriptionJob>(`/transcriptions/${jobId}/summary`).then((r) => r.data),
+    onSuccess: (job: TranscriptionJob) => {
+      qc.setQueryData<TranscriptionJob[]>(["transcriptions"], (prev) =>
+        prev ? prev.map((j) => (j.id === job.id ? job : j)) : prev
+      )
+      void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      toast.success("Summary queued")
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      toast.error(typeof detail === "string" ? detail : "Could not queue summary")
+    },
+  })
 
-  const pageCount = Math.max(1, Math.ceil(filteredJobs.length / PAGE_SIZE))
-  const pagedJobs = filteredJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const cancelSummaryMutation = useMutation({
+    mutationFn: (jobId: number) =>
+      api.post<TranscriptionJob>(`/transcriptions/${jobId}/summary/cancel`).then((r) => r.data),
+    onSuccess: (job: TranscriptionJob) => {
+      qc.setQueryData<TranscriptionJob[]>(["transcriptions"], (prev) =>
+        prev ? prev.map((j) => (j.id === job.id ? job : j)) : prev
+      )
+      void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      toast.success("Summary cancelled")
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      toast.error(typeof detail === "string" ? detail : "Could not cancel summary")
+    },
+  })
+
+  const listItems = useMemo<JobListItem[]>(() => {
+    return jobs.flatMap((job) => {
+      const items: JobListItem[] = [
+        { kind: "transcription", id: `transcription-${job.id}`, status: job.status, job, sortAt: job.created_at },
+      ]
+      if (job.summary_status !== "idle") {
+        items.push({
+          kind: "summary",
+          id: `summary-${job.id}`,
+          status: job.summary_status,
+          job,
+          sortAt: summarySortDate(job),
+        })
+      }
+      return items
+    }).sort((a, b) => new Date(b.sortAt).getTime() - new Date(a.sortAt).getTime())
+  }, [jobs])
+
+  const filteredItems = useMemo(() => {
+    if (statusFilter === "all") return listItems
+    return listItems.filter((item) => item.status === statusFilter)
+  }, [listItems, statusFilter])
+
+  const pageCount = Math.max(1, Math.ceil(filteredItems.length / PAGE_SIZE))
+  const pagedItems = filteredItems.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
   useEffect(() => {
     setPage(1)
@@ -259,8 +334,8 @@ export default function Jobs() {
     if (page > pageCount) setPage(pageCount)
   }, [page, pageCount])
 
-  const toggleExpanded = (jobId: number) => {
-    setExpandedId((current) => (current === jobId ? null : jobId))
+  const toggleExpanded = (itemId: string) => {
+    setExpandedId((current) => (current === itemId ? null : itemId))
   }
 
   return (
@@ -293,7 +368,7 @@ export default function Jobs() {
         <Card>
           <CardContent className="py-12 text-center text-sm text-muted-foreground">No jobs yet.</CardContent>
         </Card>
-      ) : filteredJobs.length === 0 ? (
+      ) : filteredItems.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-sm text-muted-foreground">No jobs match this filter.</CardContent>
         </Card>
@@ -302,24 +377,162 @@ export default function Jobs() {
           <PaginationControls
             page={page}
             pageCount={pageCount}
-            totalItems={filteredJobs.length}
+            totalItems={filteredItems.length}
             pageSize={PAGE_SIZE}
             itemLabel="jobs"
             onPageChange={setPage}
           />
 
-          {pagedJobs.map((job) => {
-            const expanded = expandedId === job.id
+          {pagedItems.map((item) => {
+            if (item.kind === "summary") {
+              const job = item.job
+              const expanded = expandedId === item.id
+              return (
+                <Card key={item.id} className={expanded ? "border-primary" : ""}>
+                  <button
+                    type="button"
+                    onClick={() => toggleExpanded(item.id)}
+                    className="flex w-full flex-col gap-3 p-4 text-left transition-colors hover:bg-muted/40 sm:flex-row sm:items-center sm:justify-between"
+                    aria-expanded={expanded}
+                  >
+                    <div className="flex min-w-0 flex-1 items-start gap-3">
+                      <span className="mt-0.5 text-muted-foreground">
+                        {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <Brain className="h-4 w-4 text-muted-foreground" />
+                          <span className="truncate text-sm font-medium">
+                            Summary for {audioTitle(job.audio_file, `Job #${job.id}`)}
+                          </span>
+                        </div>
+                        <p className="mt-1 truncate text-xs text-muted-foreground">
+                          Parent transcription #{job.id} · {job.summary_model ?? "summary model"} ·{" "}
+                          {job.summary_updated_at ? formatDateTimeLocal(job.summary_updated_at) : formatDateTimeLocal(job.created_at)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                      <Badge variant="outline" className={summaryStatusBadgeClass(item.status)}>
+                        Summary {item.status}
+                      </Badge>
+                      <span className="rounded-md bg-muted/40 px-2 py-1 text-xs">
+                        <span className="text-muted-foreground">Type </span>
+                        <span className="font-medium">Summarization</span>
+                      </span>
+                    </div>
+                  </button>
+
+                  {expanded && (
+                    <CardContent className="space-y-4 border-t pt-4">
+                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                        <MetadataItem label="Summary Job" value={`#${job.id}`} />
+                        <MetadataItem
+                          label="Status"
+                          value={
+                            <Badge variant="outline" className={summaryStatusBadgeClass(item.status)}>
+                              Summary {item.status}
+                            </Badge>
+                          }
+                        />
+                        <MetadataItem label="Model" value={job.summary_model ?? "Not selected"} />
+                        <MetadataItem label="Queued" value={job.summary_queued_at ? formatDateTimeLocal(job.summary_queued_at) : "-"} />
+                        <MetadataItem label="Started" value={job.summary_started_at ? formatDateTimeLocal(job.summary_started_at) : "Not started"} />
+                        <MetadataItem label="Finished" value={job.summary_finished_at ? formatDateTimeLocal(job.summary_finished_at) : "Not finished"} />
+                        <MetadataItem label="Queue wait" value={summaryQueueWait(job)} />
+                        <MetadataItem label="Runtime" value={summaryRuntime(job)} />
+                        <MetadataItem label="Updated" value={job.summary_updated_at ? formatDateTimeLocal(job.summary_updated_at) : "-"} />
+                        <MetadataItem label="Parent Job" value={`#${job.id}`} />
+                        <MetadataItem label="Audio" value={audioTitle(job.audio_file, "Unknown file")} />
+                      </div>
+
+                      {job.summary_error && (
+                        <p className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
+                          {job.summary_error}
+                        </p>
+                      )}
+                      {job.summary_text ? (
+                        <div className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-background p-3 text-sm leading-relaxed">
+                          {job.summary_text}
+                        </div>
+                      ) : (
+                        <p className="rounded-md bg-background p-3 text-sm text-muted-foreground">
+                          {job.summary_status === "queued" || job.summary_status === "running"
+                            ? "Summary is being generated."
+                            : "No summary text is available."}
+                        </p>
+                      )}
+
+                      <div className="flex flex-wrap gap-2">
+                        {job.summary_text && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="w-full sm:w-auto"
+                            onClick={() => {
+                              navigator.clipboard.writeText(job.summary_text ?? "")
+                              toast.success("Summary copied")
+                            }}
+                          >
+                            <Copy className="mr-2 h-4 w-4" />
+                            Copy summary
+                          </Button>
+                        )}
+                        <Button type="button" variant="outline" className="w-full sm:w-auto" asChild>
+                          <Link to={`/transcriptions?job=${job.id}`}>
+                            <FileText className="mr-2 h-4 w-4" />
+                            Open transcription
+                          </Link>
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="w-full sm:w-auto"
+                          disabled={summaryMutation.isPending || job.summary_status === "queued" || job.summary_status === "running"}
+                          onClick={() => summaryMutation.mutate(job.id)}
+                        >
+                          {summaryMutation.isPending ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Brain className="mr-2 h-4 w-4" />
+                          )}
+                          {job.summary_text ? "Regenerate summary" : "Generate summary"}
+                        </Button>
+                        {(job.summary_status === "queued" || job.summary_status === "running") && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="w-full sm:w-auto"
+                            disabled={cancelSummaryMutation.isPending}
+                            onClick={() => cancelSummaryMutation.mutate(job.id)}
+                          >
+                            {cancelSummaryMutation.isPending ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <Ban className="mr-2 h-4 w-4" />
+                            )}
+                            Cancel summary
+                          </Button>
+                        )}
+                      </div>
+                    </CardContent>
+                  )}
+                </Card>
+              )
+            }
+
+            const job = item.job
+            const expanded = expandedId === item.id
             const progress = jobProgress(job)
             const eta = jobEta(job, jobs)
             const runningWorkers = job.running_worker_names ?? []
             const runningWorkerLabel = runningWorkers.length > 0 ? runningWorkers.join(", ") : null
 
             return (
-              <Card key={job.id} className={expanded ? "border-primary" : ""}>
+              <Card key={item.id} className={expanded ? "border-primary" : ""}>
                 <button
                   type="button"
-                  onClick={() => toggleExpanded(job.id)}
+                  onClick={() => toggleExpanded(item.id)}
                   className="flex w-full flex-col gap-3 p-4 text-left transition-colors hover:bg-muted/40 sm:flex-row sm:items-center sm:justify-between"
                   aria-expanded={expanded}
                 >
@@ -462,6 +675,95 @@ export default function Jobs() {
                       </div>
                     )}
 
+                    {job.status === "succeeded" && (
+                      <div className="space-y-3 rounded-md border bg-muted/20 p-3">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <h3 className="flex items-center gap-2 text-sm font-semibold">
+                              <Brain className="h-4 w-4" />
+                              Summary
+                            </h3>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              {job.summary_model ? `${job.summary_model} · ` : ""}
+                              {job.summary_status || "idle"}
+                              {job.summary_started_at ? ` · runtime ${summaryRuntime(job)}` : ""}
+                              {job.summary_updated_at ? ` · updated ${formatDateTimeLocal(job.summary_updated_at)}` : ""}
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {job.summary_text && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  navigator.clipboard.writeText(job.summary_text ?? "")
+                                  toast.success("Summary copied")
+                                }}
+                              >
+                                <Copy className="mr-2 h-3 w-3" />
+                                Copy
+                              </Button>
+                            )}
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={summaryMutation.isPending || job.summary_status === "queued" || job.summary_status === "running"}
+                              onClick={() => summaryMutation.mutate(job.id)}
+                            >
+                              {summaryMutation.isPending ? (
+                                <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                              ) : (
+                                <Brain className="mr-2 h-3 w-3" />
+                              )}
+                              {job.summary_text ? "Regenerate" : "Generate"}
+                            </Button>
+                            {(job.summary_status === "queued" || job.summary_status === "running") && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                disabled={cancelSummaryMutation.isPending}
+                                onClick={() => cancelSummaryMutation.mutate(job.id)}
+                              >
+                                {cancelSummaryMutation.isPending ? (
+                                  <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                                ) : (
+                                  <Ban className="mr-2 h-3 w-3" />
+                                )}
+                                Cancel
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                        {job.summary_status !== "idle" && (
+                          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                            <MetadataItem label="Queued" value={job.summary_queued_at ? formatDateTimeLocal(job.summary_queued_at) : "-"} />
+                            <MetadataItem label="Started" value={job.summary_started_at ? formatDateTimeLocal(job.summary_started_at) : "Not started"} />
+                            <MetadataItem label="Queue wait" value={summaryQueueWait(job)} />
+                            <MetadataItem label="Runtime" value={summaryRuntime(job)} />
+                          </div>
+                        )}
+                        {job.summary_error && (
+                          <p className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
+                            {job.summary_error}
+                          </p>
+                        )}
+                        {job.summary_text ? (
+                          <div className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-background p-3 text-sm leading-relaxed">
+                            {job.summary_text}
+                          </div>
+                        ) : (
+                          <p className="rounded-md bg-background p-3 text-sm text-muted-foreground">
+                            {job.summary_status === "queued" || job.summary_status === "running"
+                              ? "Summary is being generated."
+                              : "No summary generated yet."}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     {job.partial_transcript_text && (
                       <div className="space-y-2">
                         <div>
@@ -520,7 +822,7 @@ export default function Jobs() {
           <PaginationControls
             page={page}
             pageCount={pageCount}
-            totalItems={filteredJobs.length}
+            totalItems={filteredItems.length}
             pageSize={PAGE_SIZE}
             itemLabel="jobs"
             onPageChange={setPage}

@@ -2,7 +2,7 @@
 
 ASR UI is a self-hosted transcription web app built around local ASR models. It provides private audio uploads, per-user transcription jobs, local Whisper/GigaAM model management, transcript review, and transcript downloads.
 
-Version: `1.1.2`
+Version: `2.0.0`
 
 ## Features
 
@@ -11,14 +11,26 @@ Version: `1.1.2`
 - Uploads for common audio formats with duration probing through `ffmpeg`.
 - Whisper and GigaAM model catalog, install, cancel, and remove flows.
 - Transcription queue with progress, cancellation, transcript cleanup, and download outputs.
+- Optional all-local transcript summarization through an Ollama service, with chunking tuned for Raspberry Pi 5.
+- Telegram ingestion, user preferences, worker/model selection, split jobs, and optional summary delivery.
 - Worker scheduling uses per-model speed history so split jobs account for how fast each worker is with the selected ASR model.
 - Responsive React interface for desktop and mobile use.
+
+## What's New in 2.0.0
+
+- Added local Ollama transcript summaries with manual, automatic, and Telegram-requested flows.
+- Added summary chunking, bounded Ollama generation, serialized summary execution, and clearer summary failure messages for low-power hosts.
+- Added GigaAM v3 support with local speech-aware audio chunking for long recordings.
+- Added Telegram bot settings, allowed-user preferences, worker/model targeting, and summary notifications.
+- Improved distributed worker scheduling by using per-model worker speed history.
+- Added Raspberry Pi and remote-worker deployment settings, including PyTorch CPU thread limits for GigaAM.
 
 ## Stack
 
 - Frontend: React, Vite, TypeScript, Tailwind, shadcn-style UI primitives.
 - Backend: FastAPI, async SQLAlchemy, SQLite, JWT cookies.
 - Transcription: `ffmpeg` audio conversion, `whisper.cpp` GGML models, and GigaAM v3 Hugging Face snapshots.
+- Summarization: local Ollama models, disabled until configured by an admin.
 - Deployment: Docker Compose with frontend on `8824` and backend on `8825` by default.
 
 ## Quick Start
@@ -46,6 +58,20 @@ Useful settings:
 - `GIGAAM_CHUNK_TARGET_SECONDS` and `GIGAAM_CHUNK_OVERLAP_SECONDS`: speech-aware chunk core target and local context overlap. Defaults `22.0` and `1.0`.
 - `GIGAAM_VAD_ENABLED`, `GIGAAM_VAD_MODE`, `GIGAAM_VAD_MERGE_SILENCE_MS`, and `GIGAAM_VAD_PAD_MS`: local WebRTC VAD settings used to prefer silence/low-energy GigaAM chunk boundaries.
 - `GIGAAM_TORCH_THREADS` and `GIGAAM_TORCH_INTEROP_THREADS`: PyTorch CPU thread limits for GigaAM inference. Raspberry Pi 5 deploys use `3` and `1`; the MacBook worker target uses `4` and `1`.
+- `SUMMARIZATION_OLLAMA_BASE_URL`: local Ollama endpoint used for transcript summaries. Docker Compose defaults to `http://ollama:11434`.
+- `BACKEND_PYTHON_IMAGE`, `FRONTEND_NODE_IMAGE`, and `FRONTEND_NGINX_IMAGE`: optional Docker base image overrides. Defaults use Docker Hub official images; set these to `public.ecr.aws/docker/library/...` if Docker Hub is unavailable in your network.
+
+## Local Summarization
+
+Summarization never calls cloud APIs. Docker Compose includes an `ollama` service with a persistent `ollama_data` volume. Admins can enable summaries, pull an Ollama model, choose the active model, and optionally enable automatic summaries from Settings.
+
+Recommended Raspberry Pi 5 models:
+
+- `qwen2.5:3b`: better summary quality on an 8 GB Pi 5.
+- `qwen2.5:1.5b`: lighter fallback for lower memory or faster responses.
+- `llama3.2:3b`: general-purpose fallback.
+
+Manual summaries are available from the Transcriptions page after a job succeeds. Long transcripts are summarized in chunks and then merged into one final summary.
 
 ## Deploy
 

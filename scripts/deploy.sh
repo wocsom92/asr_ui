@@ -224,7 +224,7 @@ run_sftp_batch() {
   fi
 }
 
-DEPLOY_ITEMS=(backend frontend scripts/post_deploy_check.sh docker-compose.yml .dockerignore)
+DEPLOY_ITEMS=(backend frontend scripts/post_deploy_check.sh docker-compose.yml .dockerignore README.md)
 for item in "${DEPLOY_ITEMS[@]}"; do
   [[ -e "${SOURCE_ROOT}/${item}" ]] || die "Required source item missing: ${SOURCE_ROOT}/${item}"
 done

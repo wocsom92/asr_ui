@@ -1,8 +1,14 @@
 import { useQuery } from "@tanstack/react-query"
-import { AudioLines, Cpu, FileAudio, Loader2, ServerCog } from "lucide-react"
+import { AudioLines, Brain, CheckCircle2, Cpu, FileAudio, Loader2, ServerCog } from "lucide-react"
 import { Link } from "react-router-dom"
 import api from "@/api/client"
-import type { AudioFile, TranscriptionJob, TranscriptionModel, TranscriptionWorker } from "@/types"
+import type {
+  AudioFile,
+  SummarizationSettingsResponse,
+  TranscriptionJob,
+  TranscriptionModel,
+  TranscriptionWorker,
+} from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { formatDateTimeLocal } from "@/lib/datetime"
@@ -10,6 +16,18 @@ import { formatBytes, formatDuration } from "@/lib/format"
 import { useAuthStore } from "@/stores/auth"
 import { audioTitle } from "@/lib/audio"
 import { jobStatusBadgeClass, jobStatusLabel } from "@/lib/jobs"
+
+function modelProviderLabel(provider: string) {
+  if (provider === "whisper.cpp") return "Whisper"
+  if (provider === "gigaam") return "GigaAM"
+  return provider
+}
+
+function compactNumber(value: number) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}K`
+  return String(value)
+}
 
 export default function Dashboard() {
   const user = useAuthStore((s) => s.user)
@@ -25,6 +43,12 @@ export default function Dashboard() {
   const { data: models = [] } = useQuery<TranscriptionModel[]>({
     queryKey: ["models"],
     queryFn: () => api.get("/models").then((r) => r.data),
+    enabled: user?.role === "admin",
+    refetchInterval: 10000,
+  })
+  const { data: summarizationSettings } = useQuery<SummarizationSettingsResponse>({
+    queryKey: ["system", "summarization"],
+    queryFn: () => api.get("/system/summarization").then((r) => r.data),
     enabled: user?.role === "admin",
     refetchInterval: 10000,
   })
@@ -47,7 +71,34 @@ export default function Dashboard() {
       (job.output_vtt_size_bytes ?? 0),
     0
   )
+  const completedSummaries = jobs.filter((job) => job.summary_status === "succeeded" && job.summary_text)
+  const activeSummaryJobs = jobs.filter((job) => job.summary_status === "queued" || job.summary_status === "running")
+  const failedSummaryJobs = jobs.filter((job) => job.summary_status === "failed")
+  const activeTranscriptionJobs = jobs.filter((job) => job.status === "queued" || job.status === "running")
+  const activeQueueCount = activeTranscriptionJobs.length + activeSummaryJobs.length
+  const summaryCoverage = finishedJobs.length > 0
+    ? Math.round((completedSummaries.length / finishedJobs.length) * 100)
+    : 0
+  const summaryWordCount = completedSummaries.reduce(
+    (sum, job) => sum + (job.summary_text?.trim().split(/\s+/).filter(Boolean).length ?? 0),
+    0
+  )
+  const averageSummaryWords = completedSummaries.length > 0
+    ? Math.round(summaryWordCount / completedSummaries.length)
+    : 0
   const recent = jobs.slice(0, 8)
+  const installedModels = models.filter((model) => model.status === "installed")
+  const installedSummaryModels = summarizationSettings?.models ?? []
+  const installedModelProviderSummary = Object.entries(
+    installedModels.reduce<Record<string, number>>((counts, model) => {
+      const label = modelProviderLabel(model.provider)
+      counts[label] = (counts[label] ?? 0) + 1
+      return counts
+    }, {})
+  )
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { sensitivity: "base" }))
+    .map(([provider, count]) => `${count} ${provider}`)
+    .join(" · ")
   const onlineWorkerList = workers.filter((worker) => worker.online)
   const availableWorkers = onlineWorkerList.filter(
     (worker) => worker.accepted && worker.current_job_count === 0 && worker.status === "idle"
@@ -68,7 +119,7 @@ export default function Dashboard() {
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5">
           <Card>
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle className="text-sm font-medium">Audio Files</CardTitle>
@@ -99,9 +150,33 @@ export default function Dashboard() {
               <Loader2 className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{jobs.filter((j) => ["queued", "running"].includes(j.status)).length}</div>
+              <div className="text-2xl font-bold">{activeQueueCount}</div>
               <p className="text-xs text-muted-foreground">
-                worker queue
+                {activeTranscriptionJobs.length} transcriptions · {activeSummaryJobs.length} summaries
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle className="text-sm font-medium">Summaries</CardTitle>
+              <Brain className="h-4 w-4 text-muted-foreground" />
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">{completedSummaries.length}</div>
+              <p className="text-xs text-muted-foreground">
+                {summaryCoverage}% of finished transcriptions
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle className="text-sm font-medium">Summary Output</CardTitle>
+              <CheckCircle2 className="h-4 w-4 text-muted-foreground" />
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">{compactNumber(summaryWordCount)}</div>
+              <p className="text-xs text-muted-foreground">
+                {failedSummaryJobs.length} failed · {averageSummaryWords > 0 ? `${compactNumber(averageSummaryWords)} avg words` : "no generated summaries"}
               </p>
             </CardContent>
           </Card>
@@ -128,8 +203,22 @@ export default function Dashboard() {
                   <Cpu className="h-4 w-4 text-muted-foreground" />
                 </CardHeader>
                 <CardContent>
-                  <div className="text-2xl font-bold">{models.filter((m) => m.status === "installed").length}</div>
-                  <p className="text-xs text-muted-foreground">installed Whisper variants</p>
+                  <div className="text-2xl font-bold">
+                    {installedModels.length + installedSummaryModels.length}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {installedModels.length} transcription · {installedSummaryModels.length} summary
+                  </p>
+                  <p className="mt-2 truncate text-xs font-medium">
+                    {installedModelProviderSummary || summarizationSettings?.selected_model
+                      ? [
+                          installedModelProviderSummary,
+                          summarizationSettings?.selected_model
+                            ? `summary: ${summarizationSettings.selected_model}`
+                            : "",
+                        ].filter(Boolean).join(" · ")
+                      : "No installed models"}
+                  </p>
                 </CardContent>
               </Card>
             </>

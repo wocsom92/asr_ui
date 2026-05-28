@@ -1,6 +1,9 @@
 services:
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        PYTHON_IMAGE: "${BACKEND_PYTHON_IMAGE:-python:3.12-slim}"
     ports:
       - "${BACKEND_PORT:-8825}:8000"
     volumes:
@@ -14,10 +17,21 @@ services:
       GIGAAM_TORCH_INTEROP_THREADS: "${GIGAAM_TORCH_INTEROP_THREADS:-1}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
     restart: unless-stopped
 
   telegram-egress-proxy:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        PYTHON_IMAGE: "${BACKEND_PYTHON_IMAGE:-python:3.12-slim}"
     command: ["python", "-m", "app.tools.telegram_egress_proxy"]
     network_mode: "host"
     env_file:
@@ -36,7 +50,11 @@ services:
       retries: 3
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        NODE_IMAGE: "${FRONTEND_NODE_IMAGE:-node:20-alpine}"
+        NGINX_IMAGE: "${FRONTEND_NGINX_IMAGE:-nginx:alpine}"
     ports:
       - "${FRONTEND_PORT:-8824}:80"
     depends_on:
@@ -45,7 +63,10 @@ services:
 
   worker:
     profiles: ["worker"]
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        PYTHON_IMAGE: "${BACKEND_PYTHON_IMAGE:-python:3.12-slim}"
     command: ["python", "-m", "app.worker"]
     volumes:
       - worker_data:/data
@@ -65,3 +86,4 @@ volumes:
   model_data:
   worker_data:
   worker_models:
+  ollama_data:

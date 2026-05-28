@@ -69,6 +69,14 @@ async def init_db():
             ("partial_transcript_text", "TEXT"),
             ("partial_transcript_json", "TEXT"),
             ("partial_updated_at", "DATETIME"),
+            ("summary_text", "TEXT"),
+            ("summary_status", "VARCHAR(20) DEFAULT 'idle'"),
+            ("summary_error", "TEXT"),
+            ("summary_model", "VARCHAR(120)"),
+            ("summary_queued_at", "DATETIME"),
+            ("summary_started_at", "DATETIME"),
+            ("summary_finished_at", "DATETIME"),
+            ("summary_updated_at", "DATETIME"),
             ("source", "VARCHAR(50)"),
             ("telegram_chat_id", "VARCHAR(100)"),
             ("telegram_user_id", "VARCHAR(100)"),
@@ -76,6 +84,9 @@ async def init_db():
             ("telegram_file_id", "VARCHAR(255)"),
             ("telegram_result_sent_at", "DATETIME"),
             ("telegram_result_error", "TEXT"),
+            ("telegram_summary_requested", "BOOLEAN DEFAULT 0"),
+            ("telegram_summary_sent_at", "DATETIME"),
+            ("telegram_summary_error", "TEXT"),
             ("worker_id", "INTEGER"),
             ("worker_name_snapshot", "VARCHAR(120)"),
             ("preferred_worker_id", "INTEGER"),
@@ -97,8 +108,28 @@ async def init_db():
             await conn.execute(
                 text(
                     "UPDATE transcription_jobs "
+                    "SET summary_status = 'idle' "
+                    "WHERE summary_status IS NULL OR TRIM(summary_status) = ''"
+                )
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                text(
+                    "UPDATE transcription_jobs "
                     "SET split_enabled = 0 "
                     "WHERE split_enabled IS NULL"
+                )
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                text(
+                    "UPDATE transcription_jobs "
+                    "SET telegram_summary_requested = 0 "
+                    "WHERE telegram_summary_requested IS NULL"
                 )
             )
         except Exception:

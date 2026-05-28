@@ -13,6 +13,7 @@ from uuid import uuid4
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database import async_session_factory
@@ -28,6 +29,7 @@ from app.schemas.telegram_settings import (
 )
 from app.services.audio_svc import is_supported_audio, probe_duration_seconds
 from app.services.model_catalog import get_catalog_item
+from app.services.summarization_settings import get_summarization_settings
 from app.services.telegram_settings import (
     get_telegram_bot_settings,
     get_telegram_update_offset,
@@ -35,7 +37,7 @@ from app.services.telegram_settings import (
     token_preview,
     update_telegram_bot_settings,
 )
-from app.services.worker_runtime import create_split_chunks, model_states_from_json, worker_is_online
+from app.services.worker_runtime import create_split_chunks, model_states_from_json, worker_has_model_variant, worker_is_online
 
 logger = logging.getLogger(__name__)
 _poll_task: asyncio.Task | None = None
@@ -209,6 +211,9 @@ def _sender_id(message: dict[str, Any]) -> int | None:
 
 def _message_text(message: dict[str, Any]) -> str:
     value = message.get("text")
+    if isinstance(value, str):
+        return value.strip()
+    value = message.get("caption")
     return value.strip() if isinstance(value, str) else ""
 
 
@@ -295,6 +300,9 @@ async def _handle_command(
             "/setmodel <id or variant> - choose model for your Telegram jobs\n"
             "/split - show split mode\n"
             "/setsplit <off|on|auto|default|worker ids> - choose split mode\n"
+            "/summary <on|off|status> - request summaries for your Telegram jobs\n"
+            "/list [count] - list your recent transcriptions\n"
+            "/get <id> - fetch one of your transcriptions by id\n"
             "/settings - show the worker and model that will be used",
         )
         return
@@ -315,6 +323,15 @@ async def _handle_command(
         return
     if command == "setsplit":
         await _command_set_split(config, allowed_user, chat_id, argument)
+        return
+    if command == "summary":
+        await _command_summary(config, allowed_user, chat_id, argument)
+        return
+    if command in {"list", "transcriptions"}:
+        await _command_list(config, allowed_user, chat_id, argument)
+        return
+    if command in {"get", "transcription"}:
+        await _command_get(config, allowed_user, chat_id, argument)
         return
     if command in {"settings", "current"}:
         await _command_settings(config, allowed_user, chat_id)
@@ -375,6 +392,7 @@ async def _save_allowed_user_preferences(
     preferred_model_id: int | None | object = ...,
     split_enabled: bool | None | object = ...,
     split_worker_ids: list[int] | object = ...,
+    summarize_enabled: bool | object = ...,
 ) -> TelegramBotSettings:
     updated_users: list[TelegramAllowedUser] = []
     for item in config.allowed_users:
@@ -390,6 +408,8 @@ async def _save_allowed_user_preferences(
             values["split_enabled"] = split_enabled
         if split_worker_ids is not ...:
             values["split_worker_ids"] = split_worker_ids
+        if summarize_enabled is not ...:
+            values["summarize_enabled"] = summarize_enabled
         updated_users.append(TelegramAllowedUser.model_validate(values))
 
     async with async_session_factory() as db:
@@ -557,6 +577,8 @@ async def _command_settings(
     else:
         lines.append(f"Split: off ({split_source})")
 
+    lines.append(f"Summary: {'on' if allowed_user.summarize_enabled else 'off'}")
+
     if install_variant:
         capable_workers = [
             item
@@ -667,6 +689,188 @@ async def _command_set_split(
     await send_telegram_message(config, chat_id, f"Telegram split mode enabled for: {names}.")
 
 
+async def _command_summary(
+    config: TelegramBotSettings,
+    allowed_user: TelegramAllowedUser,
+    chat_id: str,
+    argument: str,
+) -> None:
+    value = argument.strip().lower()
+    auto_note = (
+        ""
+        if await _auto_summary_available()
+        else "\nNote: the admin has auto-summarize disabled, so summaries will not be generated until it is enabled."
+    )
+    if value in {"on", "true", "yes", "1"}:
+        await _save_allowed_user_preferences(config, allowed_user, summarize_enabled=True)
+        await send_telegram_message(config, chat_id, f"Telegram summaries enabled for your future audio jobs.{auto_note}")
+        return
+    if value in {"off", "false", "no", "0"}:
+        await _save_allowed_user_preferences(config, allowed_user, summarize_enabled=False)
+        await send_telegram_message(config, chat_id, "Telegram summaries disabled for your future audio jobs.")
+        return
+    if value in {"", "status"}:
+        state = "on" if allowed_user.summarize_enabled else "off"
+        await send_telegram_message(
+            config,
+            chat_id,
+            f"Telegram summaries are {state} for your future audio jobs.\n"
+            f"Send audio with caption /summary to request a summary for just that file.{auto_note}",
+        )
+        return
+    await send_telegram_message(config, chat_id, "Usage: /summary <on|off|status>")
+
+
+def _summary_requested_from_message(message: dict[str, Any], allowed_user: TelegramAllowedUser) -> bool:
+    text = _message_text(message).lower()
+    if not text:
+        return allowed_user.summarize_enabled
+    tokens = {token.strip(".,;:!()[]{}") for token in text.replace("\n", " ").split()}
+    return allowed_user.summarize_enabled or "/summary" in tokens or "summary" in tokens
+
+
+async def _auto_summary_available() -> bool:
+    """Summaries for Telegram audio only run when the admin has auto-summarize enabled."""
+    async with async_session_factory() as db:
+        config = await get_summarization_settings(db)
+    return config.enabled and config.auto_summarize and bool(config.selected_model)
+
+
+async def _command_list(
+    config: TelegramBotSettings,
+    allowed_user: TelegramAllowedUser,
+    chat_id: str,
+    argument: str,
+) -> None:
+    limit = 10
+    token = argument.strip()
+    if token:
+        try:
+            limit = max(1, min(25, int(token)))
+        except ValueError:
+            limit = 10
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(TranscriptionJob)
+            .options(selectinload(TranscriptionJob.audio_file))
+            .where(TranscriptionJob.owner_user_id == allowed_user.app_user_id)
+            .order_by(TranscriptionJob.created_at.desc())
+            .limit(limit)
+        )
+        jobs = list(result.scalars().all())
+    if not jobs:
+        await send_telegram_message(config, chat_id, "You have no transcriptions yet.")
+        return
+    lines = [f"Your recent transcriptions (latest {len(jobs)}):"]
+    for job in jobs:
+        filename = "?"
+        if job.audio_file:
+            filename = job.audio_file.display_name or job.audio_file.original_filename
+        source = job.source or "web"
+        created = job.created_at.strftime("%Y-%m-%d %H:%M") if job.created_at else "?"
+        lines.append(f"#{job.id} [{job.status}] {source} - {filename} ({created})")
+    lines.append("Use /get <id> to download a transcription.")
+    await send_telegram_message(config, chat_id, "\n".join(lines))
+
+
+async def _command_get(
+    config: TelegramBotSettings,
+    allowed_user: TelegramAllowedUser,
+    chat_id: str,
+    argument: str,
+) -> None:
+    token = argument.strip()
+    if not token.isdigit():
+        await send_telegram_message(config, chat_id, "Usage: /get <transcription id>")
+        return
+    job_id = int(token)
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(TranscriptionJob)
+            .options(selectinload(TranscriptionJob.audio_file))
+            .where(
+                TranscriptionJob.id == job_id,
+                TranscriptionJob.owner_user_id == allowed_user.app_user_id,
+            )
+        )
+        job = result.scalar_one_or_none()
+    if job is None:
+        await send_telegram_message(config, chat_id, f"Transcription #{job_id} was not found.")
+        return
+    await _send_transcription_result(config, chat_id, job)
+
+
+async def _send_transcription_result(
+    config: TelegramBotSettings,
+    chat_id: str,
+    job: TranscriptionJob,
+) -> None:
+    filename = None
+    if job.audio_file:
+        filename = job.audio_file.display_name or job.audio_file.original_filename
+    source = job.source or "web"
+    header = f"Transcription #{job.id} [{job.status}] - {source}"
+    if filename:
+        header += f"\nFile: {filename}"
+
+    if job.status != "succeeded":
+        detail = f"\n{job.error_message}" if job.error_message else ""
+        await send_telegram_message(config, chat_id, f"{header}\nNo transcript is available yet.{detail}")
+        return
+
+    sent = False
+    if job.output_txt_path and Path(job.output_txt_path).exists():
+        sent = await _send_file_document(config, chat_id, Path(job.output_txt_path), f"transcription_{job.id}.txt", header)
+    elif job.transcript_text:
+        sent = await send_telegram_text_document(
+            config,
+            chat_id,
+            filename=f"transcription_{job.id}.txt",
+            text=job.transcript_text,
+            caption=header,
+        )
+    elif job.output_json_path and Path(job.output_json_path).exists():
+        sent = await _send_file_document(config, chat_id, Path(job.output_json_path), f"transcription_{job.id}.json", header)
+
+    if not sent:
+        await send_telegram_message(config, chat_id, f"{header}\nTranscript file is missing.")
+        return
+
+    if job.summary_status == "succeeded" and job.summary_text:
+        await send_telegram_text_document(
+            config,
+            chat_id,
+            filename=f"summary_{job.id}.txt",
+            text=job.summary_text,
+            caption=f"Summary for transcription #{job.id}.",
+        )
+
+
+async def _send_file_document(
+    config: TelegramBotSettings,
+    chat_id: str,
+    path: Path,
+    filename: str,
+    caption: str,
+) -> bool:
+    try:
+        with path.open("rb") as handle:
+            response = await telegram_api_request(
+                config,
+                "POST",
+                "sendDocument",
+                data={"chat_id": chat_id, "caption": caption[:1024]},
+                files={"document": (filename, handle, "application/octet-stream")},
+            )
+    except Exception as exc:
+        logger.error("Telegram sendDocument failed: %s", exc)
+        return False
+    if response.status_code != 200:
+        logger.error("Telegram sendDocument failed: %s", response.text)
+        return False
+    return True
+
+
 async def _handle_update(config: TelegramBotSettings, update: dict[str, Any]) -> None:
     message = update.get("message")
     if not isinstance(message, dict):
@@ -682,18 +886,18 @@ async def _handle_update(config: TelegramBotSettings, update: dict[str, Any]) ->
         await send_telegram_message(config, chat_id, "This Telegram user is not allowed to submit audio.")
         return
 
+    attachment = _attachment_from_message(message)
     command = _parse_command(_message_text(message))
-    if command is not None:
+    if command is not None and attachment is None:
         await _handle_command(config, allowed_user, chat_id, command[0], command[1])
         return
 
-    attachment = _attachment_from_message(message)
     if attachment is None:
         await send_telegram_message(
             config,
             chat_id,
             "Send an audio, voice message, or supported audio document.\n"
-            "Commands: /workers, /setworker, /models, /setmodel, /settings",
+            "Commands: /workers, /setworker, /models, /setmodel, /summary, /settings",
         )
         return
     if not is_supported_audio(attachment.filename):
@@ -703,6 +907,7 @@ async def _handle_update(config: TelegramBotSettings, update: dict[str, Any]) ->
         await send_telegram_message(config, chat_id, f"Audio file is too large. Limit is {settings.max_upload_mb} MB.")
         return
 
+    summary_requested = _summary_requested_from_message(message, allowed_user) and await _auto_summary_available()
     try:
         job = await _store_audio_and_create_job(
             config=config,
@@ -712,6 +917,7 @@ async def _handle_update(config: TelegramBotSettings, update: dict[str, Any]) ->
             message_id=message.get("message_id"),
             attachment=attachment,
             allowed_user=allowed_user,
+            summary_requested=summary_requested,
         )
     except ValueError as exc:
         await send_telegram_message(config, chat_id, str(exc))
@@ -720,7 +926,9 @@ async def _handle_update(config: TelegramBotSettings, update: dict[str, Any]) ->
     await send_telegram_message(
         config,
         chat_id,
-        f"Audio received: {attachment.filename}\nTranscription job #{job.id} queued.",
+        f"Audio received: {attachment.filename}\n"
+        f"Transcription job #{job.id} queued."
+        f"{' Summary will be sent when ready.' if job.telegram_summary_requested else ''}",
     )
 
 
@@ -733,12 +941,13 @@ async def _store_audio_and_create_job(
     message_id: int | None,
     attachment: TelegramAttachment,
     allowed_user: TelegramAllowedUser,
+    summary_requested: bool,
 ) -> TranscriptionJob:
     async with async_session_factory() as db:
         split_enabled, split_worker_ids, _ = _effective_split_config(config, allowed_user)
-        split_workers = await _load_split_workers(db, split_worker_ids) if split_enabled else []
         worker = None if split_enabled else await _load_preferred_worker(db, allowed_user)
         model = await _load_selected_model(db, config, allowed_user, worker)
+        split_workers = await _load_split_workers(db, split_worker_ids, model) if split_enabled else []
         language = _normalize_job_language(model, config.default_language)
         stored_path, size = await _download_telegram_file(config, app_user_id, attachment)
         duration = await probe_duration_seconds(stored_path)
@@ -767,6 +976,7 @@ async def _store_audio_and_create_job(
             telegram_user_id=str(telegram_user_id),
             telegram_message_id=str(message_id) if message_id is not None else None,
             telegram_file_id=attachment.file_id,
+            telegram_summary_requested=summary_requested,
             preferred_worker_id=None if split_enabled else (worker.id if worker else None),
             preferred_worker_name_snapshot=(
                 f"Splitter: {', '.join(_worker_label(worker) for worker in split_workers)}"
@@ -810,6 +1020,7 @@ async def _load_preferred_worker(
 async def _load_split_workers(
     db: AsyncSession,
     worker_ids: list[int],
+    model: TranscriptionModel,
 ) -> list[TranscriptionWorker]:
     if not worker_ids:
         return []
@@ -826,7 +1037,16 @@ async def _load_split_workers(
     missing = [worker_id for worker_id in worker_ids if worker_id not in found]
     if missing:
         raise ValueError(f"Telegram split workers are no longer available: {', '.join(map(str, missing))}.")
-    return [found[worker_id] for worker_id in worker_ids]
+    workers = [found[worker_id] for worker_id in worker_ids]
+    unavailable = [
+        worker
+        for worker in workers
+        if not worker_is_online(worker) or not worker_has_model_variant(worker, model.variant)
+    ]
+    if unavailable:
+        names = ", ".join(_worker_label(worker) for worker in unavailable)
+        raise ValueError(f"Telegram split workers are not online with {model.display_name}: {names}.")
+    return workers
 
 
 async def _load_selected_model(
@@ -880,10 +1100,13 @@ async def _download_telegram_file(
         params={"file_id": attachment.file_id},
     )
     if response.status_code != 200:
-        raise ValueError("Could not fetch Telegram file metadata.")
-    payload = response.json()
+        raise ValueError(f"Could not fetch Telegram file metadata: {_telegram_response_error(response)}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError("Could not fetch Telegram file metadata: Telegram returned invalid JSON.") from exc
     if not payload.get("ok"):
-        raise ValueError("Could not fetch Telegram file metadata.")
+        raise ValueError(f"Could not fetch Telegram file metadata: {_telegram_payload_error(payload)}")
     file_path = payload.get("result", {}).get("file_path")
     if not file_path:
         raise ValueError("Telegram file path is missing.")
@@ -911,6 +1134,25 @@ async def _download_telegram_file(
     return stored_path, size
 
 
+def _telegram_payload_error(payload: Any) -> str:
+    if isinstance(payload, dict):
+        description = payload.get("description")
+        if description:
+            return str(description)
+        error_code = payload.get("error_code")
+        if error_code:
+            return f"Telegram error {error_code}"
+    return "Telegram returned an unsuccessful response"
+
+
+def _telegram_response_error(response: httpx.Response) -> str:
+    try:
+        return _telegram_payload_error(response.json())
+    except ValueError:
+        text = response.text.strip()
+    return text[:500] if text else f"HTTP {response.status_code}"
+
+
 async def send_telegram_message(config: TelegramBotSettings, chat_id: str, text: str) -> bool:
     try:
         response = await telegram_api_request(
@@ -924,6 +1166,31 @@ async def send_telegram_message(config: TelegramBotSettings, chat_id: str, text:
         return False
     if response.status_code != 200:
         logger.error("Telegram sendMessage failed: %s", response.text)
+        return False
+    return True
+
+
+async def send_telegram_text_document(
+    config: TelegramBotSettings,
+    chat_id: str,
+    *,
+    filename: str,
+    text: str,
+    caption: str,
+) -> bool:
+    try:
+        response = await telegram_api_request(
+            config,
+            "POST",
+            "sendDocument",
+            data={"chat_id": chat_id, "caption": caption},
+            files={"document": (filename, text.encode("utf-8"), "text/plain; charset=utf-8")},
+        )
+    except TelegramTransportError as exc:
+        logger.error("Telegram sendDocument failed: %s", exc)
+        return False
+    if response.status_code != 200:
+        logger.error("Telegram sendDocument failed: %s", response.text)
         return False
     return True
 
@@ -980,4 +1247,64 @@ async def notify_transcription_finished(job: TranscriptionJob) -> None:
         if db_job:
             db_job.telegram_result_sent_at = datetime.now(timezone.utc) if sent else None
             db_job.telegram_result_error = error
+            await db.commit()
+
+
+def _telegram_chunks(text: str, limit: int = 3900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+async def notify_summary_finished(job_id: int) -> None:
+    async with async_session_factory() as db:
+        result = await db.execute(select(TranscriptionJob).where(TranscriptionJob.id == job_id))
+        job = result.scalar_one_or_none()
+        config = await get_telegram_bot_settings(db)
+    if (
+        not job
+        or job.source != "telegram"
+        or not job.telegram_chat_id
+        or not job.telegram_summary_requested
+        or not config.bot_token
+    ):
+        return
+
+    if job.summary_status == "succeeded" and job.summary_text:
+        sent = await send_telegram_text_document(
+            config,
+            job.telegram_chat_id,
+            filename=f"summary_{job.id}.txt",
+            text=job.summary_text,
+            caption=f"Summary for transcription job #{job.id}.",
+        )
+        error = None if sent else "Could not send Telegram summary file."
+    elif job.summary_status in {"failed", "cancelled"}:
+        detail = f"\n{job.summary_error}" if job.summary_error else ""
+        body = f"Summary for transcription job #{job.id} {job.summary_status}.{detail}"
+        error = None
+        sent = True
+        for chunk in _telegram_chunks(body):
+            if not await send_telegram_message(config, job.telegram_chat_id, chunk):
+                sent = False
+                error = "Could not send Telegram summary message."
+                break
+    else:
+        return
+
+    async with async_session_factory() as db:
+        db_job = await db.get(TranscriptionJob, job.id)
+        if db_job:
+            db_job.telegram_summary_sent_at = datetime.now(timezone.utc) if sent else None
+            db_job.telegram_summary_error = error
             await db.commit()

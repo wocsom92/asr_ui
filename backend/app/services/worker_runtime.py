@@ -17,6 +17,7 @@ from app.models.transcription_job import TranscriptionJob
 from app.models.transcription_job_chunk import TranscriptionJobChunk
 from app.models.transcription_model import TranscriptionModel
 from app.models.transcription_worker import TranscriptionWorker
+from app.services.summarizer import queue_summary_if_enabled
 from app.schemas.workers import WorkerClaimOut, WorkerHeartbeatIn, WorkerModelSpeedStat, WorkerModelState
 from app.services.model_catalog import get_catalog_item
 
@@ -120,6 +121,10 @@ def installed_variants(states: list[WorkerModelState]) -> set[str]:
 
 def worker_model_variants(worker: TranscriptionWorker) -> set[str]:
     return installed_variants(model_states_from_json(worker.model_inventory_json))
+
+
+def worker_has_model_variant(worker: TranscriptionWorker, variant: str) -> bool:
+    return _catalog_install_variant(variant) in worker_model_variants(worker)
 
 
 def requested_installs_from_json(value: str | None) -> list[str]:
@@ -300,6 +305,8 @@ async def claim_next_work(
     )
     for chunk in chunk_result.scalars().all():
         job = chunk.parent_job
+        if chunk.worker_id is not None and chunk.worker_id != worker.id:
+            continue
         allowed_split_workers = split_worker_ids(job)
         if allowed_split_workers and worker.id not in allowed_split_workers:
             continue
@@ -586,6 +593,7 @@ async def create_split_chunks(db: AsyncSession, job: TranscriptionJob) -> None:
         job.error_message = "Audio duration is required for split transcription."
         return
 
+    required_variant = _catalog_variant_for_model(job.model)
     configured_split_workers = list(dict.fromkeys(split_worker_ids(job)))
     planned_workers: list[TranscriptionWorker] = []
     if configured_split_workers:
@@ -597,7 +605,18 @@ async def create_split_chunks(db: AsyncSession, job: TranscriptionJob) -> None:
             )
         )
         workers_by_id = {worker.id: worker for worker in worker_result.scalars().all()}
+        missing_worker_ids = [worker_id for worker_id in configured_split_workers if worker_id not in workers_by_id]
+        if missing_worker_ids:
+            raise ValueError(f"Selected split workers are no longer available: {', '.join(map(str, missing_worker_ids))}.")
         planned_workers = [workers_by_id[worker_id] for worker_id in configured_split_workers if worker_id in workers_by_id]
+        unavailable = [
+            worker
+            for worker in planned_workers
+            if not worker_is_online(worker) or not worker_has_model_variant(worker, required_variant)
+        ]
+        if unavailable:
+            names = ", ".join(worker.display_name or worker.name for worker in unavailable)
+            raise ValueError(f"Selected split workers are not online with the selected model: {names}.")
         desired = len(planned_workers) or len(configured_split_workers)
     else:
         online_workers = await db.execute(
@@ -606,8 +625,14 @@ async def create_split_chunks(db: AsyncSession, job: TranscriptionJob) -> None:
                 TranscriptionWorker.is_deleted.is_not(True),
             )
         )
-        planned_workers = [worker for worker in online_workers.scalars().all() if worker_is_online(worker)]
-        desired = max(2, len(planned_workers) or 2)
+        planned_workers = [
+            worker
+            for worker in online_workers.scalars().all()
+            if worker_is_online(worker) and worker_has_model_variant(worker, required_variant)
+        ]
+        desired = len(planned_workers)
+    if desired < 2:
+        raise ValueError("Split transcription needs at least two online workers with the selected model.")
     duration = float(job.audio_file.duration_seconds)
     max_by_duration = max(1, math.floor(duration / max(1, settings.asr_split_min_chunk_seconds)))
     chunk_count = min(settings.asr_split_max_chunks, desired, max_by_duration)
@@ -819,6 +844,7 @@ async def try_merge_split_job(db: AsyncSession, job_id: int) -> None:
     job.error_message = None
     job.finished_at = datetime.now(timezone.utc)
     await db.commit()
+    await queue_summary_if_enabled(job.id)
 
 
 def parse_progress_percent(text: str | None) -> int | None:

@@ -43,6 +43,8 @@ const LANGUAGES = [
   { value: "sk", label: "Slovak" },
 ]
 
+const LAST_TRANSCRIPTION_MODEL_KEY = "asr-ui:last-transcription-model-id"
+
 function AudioPreview({ file }: { file: AudioFile }) {
   return (
     <audio
@@ -208,8 +210,11 @@ export default function Files() {
         split_enabled: splitEnabled,
         preferred_worker_id: splitEnabled || preferredWorkerId === "auto" ? null : Number(preferredWorkerId),
         split_worker_ids: splitEnabled ? splitWorkerIds : [],
-      }),
+    }),
     onSuccess: () => {
+      if (modelId) {
+        window.localStorage.setItem(LAST_TRANSCRIPTION_MODEL_KEY, modelId)
+      }
       setSelectedFile(null)
       qc.invalidateQueries({ queryKey: ["transcriptions"] })
       toast.success("Transcription queued")
@@ -228,10 +233,31 @@ export default function Files() {
         ? LANGUAGES.filter((l) => l.value === "ru" || l.value === "auto")
         : LANGUAGES
 
+  const applyModelSelection = (value: string) => {
+    setModelId(value)
+    const model = installedModels.find((item) => String(item.id) === value)
+    setLanguage(
+      model?.language_mode === "english"
+        ? "en"
+        : model?.language_mode === "russian"
+          ? "ru"
+          : "auto"
+    )
+  }
+
   const openRunDialog = (file: AudioFile) => {
     setSelectedFile(file)
-    setModelId("")
-    setLanguage("auto")
+    const lastModelId = window.localStorage.getItem(LAST_TRANSCRIPTION_MODEL_KEY) ?? ""
+    const fallbackModelId = installedModels[0] ? String(installedModels[0].id) : ""
+    const initialModelId = installedModels.some((model) => String(model.id) === lastModelId)
+      ? lastModelId
+      : fallbackModelId
+    if (initialModelId) {
+      applyModelSelection(initialModelId)
+    } else {
+      setModelId("")
+      setLanguage("auto")
+    }
     setSplitEnabled(false)
     const raspiWorker = acceptedWorkers.find((worker) => worker.name === "raspi5")
     setPreferredWorkerId(raspiWorker ? String(raspiWorker.id) : "auto")
@@ -253,15 +279,8 @@ export default function Files() {
   }
 
   const handleModelChange = (value: string) => {
-    setModelId(value)
-    const model = installedModels.find((item) => String(item.id) === value)
-    setLanguage(
-      model?.language_mode === "english"
-        ? "en"
-        : model?.language_mode === "russian"
-          ? "ru"
-          : "auto"
-    )
+    window.localStorage.setItem(LAST_TRANSCRIPTION_MODEL_KEY, value)
+    applyModelSelection(value)
   }
 
   const toggleSplitWorker = (workerId: number) => {

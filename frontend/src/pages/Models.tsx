@@ -1,12 +1,14 @@
+import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Cpu, Gauge, Loader2, Square, Trash2 } from "lucide-react"
+import { Brain, Cpu, Download, Gauge, Loader2, Square, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import api from "@/api/client"
-import type { ModelCatalogItem, ModelStats, TranscriptionModel, TranscriptionWorker } from "@/types"
+import type { ModelCatalogItem, ModelStats, SummarizationSettingsResponse, TranscriptionModel, TranscriptionWorker } from "@/types"
 import { useAuthStore } from "@/stores/auth"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { formatBytes, formatDuration, formatElapsedMs } from "@/lib/format"
 
 function installPercent(model: TranscriptionModel): number | null {
@@ -80,10 +82,17 @@ function installedWorkerVariant(worker: TranscriptionWorker, item: ModelCatalogI
 export default function Models() {
   const user = useAuthStore((s) => s.user)
   const qc = useQueryClient()
+  const [summaryPullModel, setSummaryPullModel] = useState("qwen2.5:1.5b")
   const { data: catalog = [], isLoading: catalogLoading } = useQuery<ModelCatalogItem[]>({
     queryKey: ["models", "catalog"],
     queryFn: () => api.get("/models/catalog").then((r) => r.data),
     enabled: user?.role === "admin",
+  })
+  const { data: summarizationSettings, isLoading: summarizationLoading } = useQuery<SummarizationSettingsResponse>({
+    queryKey: ["system", "summarization"],
+    queryFn: () => api.get("/system/summarization").then((r) => r.data),
+    enabled: user?.role === "admin",
+    refetchInterval: user?.role === "admin" ? 5000 : false,
   })
   const { data: models = [] } = useQuery<TranscriptionModel[]>({
     queryKey: ["models"],
@@ -148,6 +157,29 @@ export default function Models() {
     },
     onError: (err: any) => toast.error(err.response?.data?.detail || "Could not request worker uninstall"),
   })
+  const pullSummaryModelMutation = useMutation({
+    mutationFn: () => api.post("/system/summarization/pull", { model: summaryPullModel.trim() }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["system", "summarization"] })
+      toast.success("Summary model pull started")
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Could not start summary model pull"),
+  })
+  const selectSummaryModelMutation = useMutation({
+    mutationFn: (selected_model: string) =>
+      api.patch("/system/summarization", {
+        enabled: summarizationSettings?.enabled ?? false,
+        ollama_base_url: summarizationSettings?.ollama_base_url ?? "http://ollama:11434",
+        selected_model,
+        auto_summarize: summarizationSettings?.auto_summarize ?? false,
+        system_prompt: summarizationSettings?.system_prompt ?? "",
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["system", "summarization"] })
+      toast.success("Summary model selected")
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Could not select summary model"),
+  })
   if (user?.role !== "admin") {
     return <div className="py-12 text-center text-muted-foreground">Admin access required.</div>
   }
@@ -172,6 +204,11 @@ export default function Models() {
       sensitivity: "base",
       numeric: true,
     }))
+  const summaryModels = [...(summarizationSettings?.models ?? [])].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true })
+  )
+  const recommendedSummaryModels = summarizationSettings?.recommended_models ?? []
+  const summaryPullStatus = summarizationSettings?.pull_status
 
   const renderWorkerModelControls = (item: ModelCatalogItem) => {
     if (acceptedWorkers.length === 0) {
@@ -252,7 +289,7 @@ export default function Models() {
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Models</h1>
-        <p className="text-muted-foreground">Install and manage local ASR models.</p>
+        <p className="text-muted-foreground">Manage transcription models separately from local summary models.</p>
       </div>
 
       {catalogLoading ? (
@@ -264,8 +301,8 @@ export default function Models() {
           {installedModels.length > 0 && (
             <section className="space-y-4">
               <div>
-                <h2 className="text-xl font-semibold tracking-tight">Installed Models</h2>
-                <p className="text-sm text-muted-foreground">Currently available on this device.</p>
+                <h2 className="text-xl font-semibold tracking-tight">Installed Transcription Models</h2>
+                <p className="text-sm text-muted-foreground">ASR models available for transcription jobs on this device.</p>
               </div>
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {installedModels.map((model) => {
@@ -388,8 +425,8 @@ export default function Models() {
 
           <section className="space-y-4">
             <div>
-              <h2 className="text-xl font-semibold tracking-tight">Model Catalog</h2>
-              <p className="text-sm text-muted-foreground">Install new models or manage unfinished installs.</p>
+              <h2 className="text-xl font-semibold tracking-tight">Transcription Model Catalog</h2>
+              <p className="text-sm text-muted-foreground">Install ASR models or manage unfinished ASR installs.</p>
             </div>
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               {catalogItems.map((item) => {
@@ -463,6 +500,139 @@ export default function Models() {
                 )
               })}
             </div>
+          </section>
+
+          <section className="space-y-4">
+            <div>
+              <h2 className="text-xl font-semibold tracking-tight">Summary Models</h2>
+              <p className="text-sm text-muted-foreground">Ollama models used only for transcript summaries.</p>
+            </div>
+            {summarizationLoading ? (
+              <div className="flex justify-center py-8">
+                <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+              </div>
+            ) : (
+              <div className="grid gap-4 lg:grid-cols-[1.5fr_1fr]">
+                <Card>
+                  <CardHeader>
+                    <div className="flex items-start justify-between gap-3">
+                      <CardTitle className="flex items-center gap-2 text-base">
+                        <Brain className="h-4 w-4" />
+                        Installed Summary Models
+                      </CardTitle>
+                      <Badge variant={summarizationSettings?.healthy ? "default" : "secondary"}>
+                        {summarizationSettings?.healthy ? "Ollama online" : "Ollama offline"}
+                      </Badge>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    {summarizationSettings?.health_error && (
+                      <p className="rounded-md bg-destructive/10 p-2 text-sm text-destructive">
+                        {summarizationSettings.health_error}
+                      </p>
+                    )}
+                    {summaryPullStatus && summaryPullStatus.status !== "idle" && (
+                      <div className="rounded-md border bg-muted/30 p-3 text-sm">
+                        <p className="font-medium">
+                          {summaryPullStatus.model ?? "Summary model"} · {summaryPullStatus.status}
+                        </p>
+                        {summaryPullStatus.message && (
+                          <p className="text-muted-foreground">{summaryPullStatus.message}</p>
+                        )}
+                        {summaryPullStatus.error && (
+                          <p className="text-destructive">{summaryPullStatus.error}</p>
+                        )}
+                      </div>
+                    )}
+                    {summaryModels.length === 0 ? (
+                      <p className="rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
+                        No Ollama summary models installed.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {summaryModels.map((model) => {
+                          const active = model.name === summarizationSettings?.selected_model
+                          return (
+                            <div
+                              key={model.name}
+                              className="flex flex-col gap-3 rounded-md border bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between"
+                            >
+                              <div className="min-w-0">
+                                <p className="truncate font-medium">{model.name}</p>
+                                <p className="text-sm text-muted-foreground">
+                                  {model.size ? formatBytes(model.size) : "Size unknown"}
+                                  {model.modified_at ? ` · modified ${model.modified_at}` : ""}
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {active && <Badge>active</Badge>}
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={active || selectSummaryModelMutation.isPending}
+                                  onClick={() => selectSummaryModelMutation.mutate(model.name)}
+                                >
+                                  Use for summaries
+                                </Button>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2 text-base">
+                      <Download className="h-4 w-4" />
+                      Pull Summary Model
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div className="flex flex-wrap gap-2">
+                      {recommendedSummaryModels.map((model) => (
+                        <Button
+                          key={model}
+                          type="button"
+                          variant={summaryPullModel === model ? "default" : "outline"}
+                          size="sm"
+                          onClick={() => setSummaryPullModel(model)}
+                        >
+                          {model}
+                        </Button>
+                      ))}
+                    </div>
+                    <Input
+                      value={summaryPullModel}
+                      onChange={(event) => setSummaryPullModel(event.currentTarget.value)}
+                      placeholder="model:tag"
+                    />
+                    <Button
+                      type="button"
+                      disabled={
+                        pullSummaryModelMutation.isPending ||
+                        !summaryPullModel.trim() ||
+                        summaryPullStatus?.status === "running"
+                      }
+                      onClick={() => pullSummaryModelMutation.mutate()}
+                    >
+                      {pullSummaryModelMutation.isPending ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Download className="mr-2 h-4 w-4" />
+                      )}
+                      Pull Model
+                    </Button>
+                    <p className="text-sm text-muted-foreground">
+                      Summary models are managed by Ollama and do not appear in transcription job model lists.
+                    </p>
+                  </CardContent>
+                </Card>
+              </div>
+            )}
           </section>
         </div>
       )}

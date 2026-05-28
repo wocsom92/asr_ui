@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     gigaam_vad_pad_ms: int = 200
     gigaam_torch_threads: Optional[int] = None
     gigaam_torch_interop_threads: Optional[int] = None
+    summarization_ollama_base_url: str = "http://ollama:11434"
 
     model_config = {
         "env_file": ".env",

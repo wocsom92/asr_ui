@@ -139,6 +139,33 @@ export interface CleanupSettingsResponse {
   deleted_count_last_run: number
 }
 
+export interface OllamaModel {
+  name: string
+  size: number | null
+  modified_at: string | null
+}
+
+export interface SummarizationPullStatus {
+  status: "idle" | "running" | "succeeded" | "failed"
+  model: string | null
+  message: string | null
+  error: string | null
+  updated_at: string | null
+}
+
+export interface SummarizationSettingsResponse {
+  enabled: boolean
+  ollama_base_url: string
+  selected_model: string
+  auto_summarize: boolean
+  system_prompt: string
+  healthy: boolean
+  health_error: string | null
+  models: OllamaModel[]
+  recommended_models: string[]
+  pull_status: SummarizationPullStatus
+}
+
 export interface TranscriptionJob {
   id: number
   owner_user_id: number
@@ -156,6 +183,14 @@ export interface TranscriptionJob {
   partial_transcript_text: string | null
   partial_transcript_json: string | null
   partial_updated_at: string | null
+  summary_text: string | null
+  summary_status: "idle" | "queued" | "running" | "succeeded" | "failed" | "cancelled"
+  summary_error: string | null
+  summary_model: string | null
+  summary_queued_at: string | null
+  summary_started_at: string | null
+  summary_finished_at: string | null
+  summary_updated_at: string | null
   source: string | null
   telegram_chat_id: string | null
   telegram_user_id: string | null

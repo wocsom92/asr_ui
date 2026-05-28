@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { ChevronDown, ChevronRight, Download, Loader2, Trash2 } from "lucide-react"
+import { Ban, Brain, ChevronDown, ChevronRight, Copy, Download, Loader2, Trash2 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 
@@ -15,7 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { audioTitle } from "@/lib/audio"
 import { formatDateTimeLocal } from "@/lib/datetime"
 import { formatBytes, formatDuration } from "@/lib/format"
-import { jobRuntime, MetadataItem } from "@/lib/jobs"
+import { jobRuntime, MetadataItem, summaryRuntime } from "@/lib/jobs"
 import type { Project, TranscriptionJob } from "@/types"
 
 const PAGE_SIZE = 20
@@ -88,6 +88,37 @@ export default function Transcriptions() {
     onError: (err: unknown) => {
       const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       toast.error(typeof detail === "string" ? detail : "Could not delete transcription")
+    },
+  })
+
+  const summaryMutation = useMutation({
+    mutationFn: (jobId: number) => api.post<TranscriptionJob>(`/transcriptions/${jobId}/summary`).then((r) => r.data),
+    onSuccess: (updated) => {
+      qc.setQueryData<TranscriptionJob[]>(["transcriptions", projectFilter], (prev) =>
+        prev ? prev.map((job) => (job.id === updated.id ? updated : job)) : prev
+      )
+      void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      toast.success("Summary queued")
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      toast.error(typeof detail === "string" ? detail : "Could not queue summary")
+    },
+  })
+
+  const cancelSummaryMutation = useMutation({
+    mutationFn: (jobId: number) =>
+      api.post<TranscriptionJob>(`/transcriptions/${jobId}/summary/cancel`).then((r) => r.data),
+    onSuccess: (updated) => {
+      qc.setQueryData<TranscriptionJob[]>(["transcriptions", projectFilter], (prev) =>
+        prev ? prev.map((job) => (job.id === updated.id ? updated : job)) : prev
+      )
+      void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      toast.success("Summary cancelled")
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      toast.error(typeof detail === "string" ? detail : "Could not cancel summary")
     },
   })
 
@@ -164,6 +195,11 @@ export default function Transcriptions() {
                       {!isFinal && (
                         <Badge variant="outline" className="mt-2 border-amber-300 bg-amber-50 text-amber-800">
                           Partial
+                        </Badge>
+                      )}
+                      {isFinal && job.summary_status && job.summary_status !== "idle" && (
+                        <Badge variant="outline" className="mt-2">
+                          Summary {job.summary_status}
                         </Badge>
                       )}
                       <div className="mt-2">
@@ -243,6 +279,87 @@ export default function Transcriptions() {
                       source={isFinal ? "auto" : "partial"}
                       title={isFinal ? "Live transcript" : "Partial transcript"}
                     />
+
+                    {isFinal && (
+                      <div className="space-y-3 rounded-md border bg-muted/20 p-3">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <h3 className="flex items-center gap-2 text-sm font-semibold">
+                              <Brain className="h-4 w-4" />
+                              Summary
+                            </h3>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              {job.summary_model ? `${job.summary_model} · ` : ""}
+                              {job.summary_status || "idle"}
+                              {job.summary_started_at ? ` · runtime ${summaryRuntime(job)}` : ""}
+                              {job.summary_updated_at ? ` · updated ${formatDateTimeLocal(job.summary_updated_at)}` : ""}
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {job.summary_text && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  navigator.clipboard.writeText(job.summary_text ?? "")
+                                  toast.success("Summary copied")
+                                }}
+                              >
+                                <Copy className="mr-2 h-3 w-3" />
+                                Copy
+                              </Button>
+                            )}
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={summaryMutation.isPending || job.summary_status === "queued" || job.summary_status === "running"}
+                              onClick={() => summaryMutation.mutate(job.id)}
+                            >
+                              {summaryMutation.isPending ? (
+                                <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                              ) : (
+                                <Brain className="mr-2 h-3 w-3" />
+                              )}
+                              {job.summary_text ? "Regenerate" : "Generate"}
+                            </Button>
+                            {(job.summary_status === "queued" || job.summary_status === "running") && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                disabled={cancelSummaryMutation.isPending}
+                                onClick={() => cancelSummaryMutation.mutate(job.id)}
+                              >
+                                {cancelSummaryMutation.isPending ? (
+                                  <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                                ) : (
+                                  <Ban className="mr-2 h-3 w-3" />
+                                )}
+                                Cancel
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                        {job.summary_error && (
+                          <p className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
+                            {job.summary_error}
+                          </p>
+                        )}
+                        {job.summary_text ? (
+                          <div className="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-background p-3 text-sm leading-relaxed">
+                            {job.summary_text}
+                          </div>
+                        ) : (
+                          <p className="rounded-md bg-background p-3 text-sm text-muted-foreground">
+                            {job.summary_status === "queued" || job.summary_status === "running"
+                              ? "Summary is being generated."
+                              : "No summary generated yet."}
+                          </p>
+                        )}
+                      </div>
+                    )}
 
                     <div className="flex flex-wrap gap-2">
                       <Button

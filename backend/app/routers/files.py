@@ -357,7 +357,12 @@ async def create_transcription(
     await db.flush()
     if body.split_enabled:
         job.audio_file = audio
-        await create_split_chunks(db, job)
+        job.model = model
+        try:
+            await create_split_chunks(db, job)
+        except ValueError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     await db.commit()
 
     result = await db.execute(

@@ -55,6 +55,14 @@ class TranscriptionJobOut(BaseModel):
     partial_transcript_text: Optional[str] = None
     partial_transcript_json: Optional[str] = None
     partial_updated_at: Optional[datetime] = None
+    summary_text: Optional[str] = None
+    summary_status: str = "idle"
+    summary_error: Optional[str] = None
+    summary_model: Optional[str] = None
+    summary_queued_at: Optional[datetime] = None
+    summary_started_at: Optional[datetime] = None
+    summary_finished_at: Optional[datetime] = None
+    summary_updated_at: Optional[datetime] = None
     source: Optional[str] = None
     telegram_chat_id: Optional[str] = None
     telegram_user_id: Optional[str] = None
@@ -62,6 +70,9 @@ class TranscriptionJobOut(BaseModel):
     telegram_file_id: Optional[str] = None
     telegram_result_sent_at: Optional[datetime] = None
     telegram_result_error: Optional[str] = None
+    telegram_summary_requested: bool = False
+    telegram_summary_sent_at: Optional[datetime] = None
+    telegram_summary_error: Optional[str] = None
     worker_id: Optional[int] = None
     worker_name_snapshot: Optional[str] = None
     preferred_worker_id: Optional[int] = None

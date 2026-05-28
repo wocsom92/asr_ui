@@ -42,6 +42,7 @@ from app.services.worker_runtime import (
     upsert_worker,
     worker_is_online,
 )
+from app.services.summarizer import queue_summary_if_enabled
 
 router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
 
@@ -455,6 +456,8 @@ async def finish_job(
         job.model.variant if job.model else None,
     )
     await db.commit()
+    if job.status == "succeeded":
+        await queue_summary_if_enabled(job.id)
     return {"ok": True}
 
 

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.__version__ import __version__
@@ -11,6 +11,11 @@ from app.schemas.telegram_settings import (
     TelegramBotTestOut,
 )
 from app.schemas.cleanup_settings import CleanupSettingsOut, CleanupSettingsUpdate
+from app.schemas.summarization_settings import (
+    SummarizationPullIn,
+    SummarizationSettingsOut,
+    SummarizationSettingsUpdate,
+)
 from app.schemas.whisper_settings import WhisperCliSettingsOut, WhisperCliSettingsUpdate
 from app.services.telegram_bot import (
     TelegramTransportError,
@@ -32,6 +37,14 @@ from app.services.whisper_settings import (
 )
 from app.services.cleanup_settings import get_cleanup_settings, update_cleanup_settings
 from app.services.job_cleanup import get_last_cleanup_deleted_count
+from app.services.summarization_settings import get_summarization_settings, update_summarization_settings
+from app.services.summarizer import (
+    SummarizationError,
+    ollama_health,
+    ollama_models,
+    pull_status,
+    start_model_pull,
+)
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
 
@@ -64,6 +77,54 @@ async def update_cleanup_config(
         **config.model_dump(),
         deleted_count_last_run=get_last_cleanup_deleted_count(),
     )
+
+
+async def _summarization_settings_out(db: AsyncSession) -> SummarizationSettingsOut:
+    config = await get_summarization_settings(db)
+    healthy, error = await ollama_health(config)
+    models = await ollama_models(config) if healthy else []
+    return SummarizationSettingsOut(
+        **config.model_dump(),
+        healthy=healthy,
+        health_error=error,
+        models=models,
+        pull_status=pull_status(),
+    )
+
+
+@router.get("/summarization", response_model=SummarizationSettingsOut)
+async def get_summarization_config(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _summarization_settings_out(db)
+
+
+@router.patch("/summarization", response_model=SummarizationSettingsOut)
+async def update_summarization_config(
+    body: SummarizationSettingsUpdate,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    await update_summarization_settings(db, body)
+    return await _summarization_settings_out(db)
+
+
+@router.post("/summarization/pull", response_model=SummarizationSettingsOut)
+async def pull_summarization_model(
+    body: SummarizationPullIn,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    config = await get_summarization_settings(db)
+    model = body.model.strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="Model name is required")
+    try:
+        await start_model_pull(config, model)
+    except SummarizationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return await _summarization_settings_out(db)
 
 
 @router.get("/whisper-cli", response_model=WhisperCliSettingsOut)

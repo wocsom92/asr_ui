@@ -13,6 +13,7 @@ class TelegramAllowedUser(BaseModel):
     preferred_model_id: Optional[int] = None
     split_enabled: Optional[bool] = None
     split_worker_ids: list[int] = Field(default_factory=list)
+    summarize_enabled: bool = False
 
 
 class TelegramBotSettings(BaseModel):

@@ -16,11 +16,14 @@ from app.database import get_db
 from app.models.audio_file import AudioFile
 from app.models.transcription_job import TranscriptionJob
 from app.models.user import User
+from app.models.transcription_worker import TranscriptionWorker
 from app.schemas.transcription import TranscriptionJobOut, TranscriptionSegmentOut
 from app.services.job_cancellation import signal_job_cancel
+from app.services.summarization_settings import get_summarization_settings
+from app.services.summarizer import cancel_summary_job, queue_summary_job
 from app.services.transcription_files import delete_transcription_outputs
 from app.models.transcription_job_chunk import TranscriptionJobChunk
-from app.services.worker_runtime import try_merge_split_job
+from app.services.worker_runtime import try_merge_split_job, worker_is_online
 
 router = APIRouter(prefix="/api/v1/transcriptions", tags=["transcriptions"])
 
@@ -147,12 +150,92 @@ def _apply_project_filter(query, project_id: str | None):
     return query.where(AudioFile.project_id == parsed_project_id)
 
 
+async def _offline_worker_ids(db: AsyncSession, worker_ids: set[int]) -> set[int]:
+    if not worker_ids:
+        return set()
+    result = await db.execute(select(TranscriptionWorker).where(TranscriptionWorker.id.in_(worker_ids)))
+    workers = {worker.id: worker for worker in result.scalars().all()}
+    return {
+        worker_id
+        for worker_id in worker_ids
+        if worker_id not in workers or not worker_is_online(workers[worker_id])
+    }
+
+
+async def _finalize_offline_cancelled_work(
+    db: AsyncSession,
+    job: TranscriptionJob,
+    now: datetime,
+) -> bool:
+    if not job.cancel_requested_at:
+        return False
+    if not job.split_enabled:
+        if job.worker_id is None:
+            return False
+        offline_ids = await _offline_worker_ids(db, {job.worker_id})
+        if job.worker_id not in offline_ids:
+            return False
+        await db.execute(
+            update(TranscriptionJob)
+            .where(
+                TranscriptionJob.id == job.id,
+                TranscriptionJob.status == "running",
+            )
+            .values(
+                status="cancelled",
+                status_text="Cancelled",
+                finished_at=now,
+                error_message=None,
+            )
+        )
+        await db.commit()
+        return True
+
+    running_worker_ids = {chunk.worker_id for chunk in job.chunks if chunk.status == "running" and chunk.worker_id}
+    offline_ids = await _offline_worker_ids(db, running_worker_ids)
+    if not offline_ids:
+        return False
+    await db.execute(
+        update(TranscriptionJobChunk)
+        .where(
+            TranscriptionJobChunk.parent_job_id == job.id,
+            TranscriptionJobChunk.status == "running",
+            TranscriptionJobChunk.worker_id.in_(offline_ids),
+        )
+        .values(
+            status="cancelled",
+            status_text="Cancelled",
+            finished_at=now,
+            error_message=None,
+        )
+    )
+    await db.commit()
+    await try_merge_split_job(db, job.id)
+    return True
+
+
+async def _reconcile_offline_cancelling_jobs(db: AsyncSession, user_id: int) -> None:
+    result = await db.execute(
+        _job_query(user_id).where(
+            TranscriptionJob.status == "running",
+            TranscriptionJob.cancel_requested_at.is_not(None),
+        )
+    )
+    changed = False
+    now = datetime.now(timezone.utc)
+    for job in result.scalars().all():
+        changed = await _finalize_offline_cancelled_work(db, job, now) or changed
+    if changed:
+        await db.commit()
+
+
 @router.get("", response_model=list[TranscriptionJobOut])
 async def list_transcriptions(
     project_id: str | None = Query(default=None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _reconcile_offline_cancelling_jobs(db, user.id)
     query = _apply_project_filter(_job_query(user.id), project_id)
     result = await db.execute(
         query.order_by(
@@ -168,6 +251,7 @@ async def get_transcription(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _reconcile_offline_cancelling_jobs(db, user.id)
     result = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
     job = result.scalar_one_or_none()
     if not job:
@@ -254,7 +338,9 @@ async def cancel_transcription(
             )
         )
         await db.commit()
+        job.cancel_requested_at = now
         await signal_job_cancel(job_id)
+        await _finalize_offline_cancelled_work(db, job, now)
         if job.split_enabled:
             await try_merge_split_job(db, job_id)
     else:
@@ -273,6 +359,65 @@ async def cancel_transcription(
         )
         .where(TranscriptionJob.id == job_id, TranscriptionJob.owner_user_id == user.id)
     )
+    return refreshed.scalar_one()
+
+
+@router.post("/{job_id}/summary", response_model=TranscriptionJobOut)
+async def summarize_transcription(
+    job_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    if job.status != "succeeded" or not job.transcript_text:
+        raise HTTPException(status_code=409, detail="Only finished transcriptions with text can be summarized")
+
+    config = await get_summarization_settings(db)
+    if not config.enabled:
+        raise HTTPException(status_code=400, detail="Summarization is disabled")
+    if not config.selected_model:
+        raise HTTPException(status_code=400, detail="No summarization model selected")
+
+    now = datetime.now(timezone.utc)
+    job.summary_status = "queued"
+    job.summary_error = None
+    job.summary_model = config.selected_model
+    job.summary_queued_at = now
+    job.summary_started_at = None
+    job.summary_finished_at = None
+    job.summary_updated_at = now
+    await db.commit()
+    queue_summary_job(job.id)
+
+    refreshed = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
+    return refreshed.scalar_one()
+
+
+@router.post("/{job_id}/summary/cancel", response_model=TranscriptionJobOut)
+async def cancel_transcription_summary(
+    job_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    if job.summary_status not in {"queued", "running"}:
+        raise HTTPException(status_code=400, detail="Only queued or running summaries can be cancelled.")
+
+    now = datetime.now(timezone.utc)
+    cancel_summary_job(job_id)
+    job.summary_status = "cancelled"
+    job.summary_error = None
+    job.summary_finished_at = now
+    job.summary_updated_at = now
+    await db.commit()
+
+    refreshed = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
     return refreshed.scalar_one()
 
 

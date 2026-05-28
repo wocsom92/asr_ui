@@ -1,5 +1,5 @@
-# Official image via AWS Public ECR mirror avoids Docker Hub rate limits.
-FROM public.ecr.aws/docker/library/python:3.12-slim
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE}
 
 WORKDIR /app
 

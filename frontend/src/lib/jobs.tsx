@@ -131,6 +131,24 @@ export function queueWait(job: TranscriptionJob): string {
   )
 }
 
+export function summaryQueueWait(job: TranscriptionJob): string {
+  const queuedAt = job.summary_queued_at ?? job.summary_updated_at
+  if (!queuedAt) return "—"
+  if (!job.summary_started_at) {
+    if (job.summary_status === "queued") return "Queued"
+    return "—"
+  }
+  return formatElapsedMs(
+    parseApiDate(job.summary_started_at).getTime() - parseApiDate(queuedAt).getTime()
+  )
+}
+
+export function summaryRuntime(job: TranscriptionJob): string {
+  if (!job.summary_started_at) return "Not started"
+  const end = job.summary_finished_at ? parseApiDate(job.summary_finished_at) : new Date()
+  return formatElapsedMs(end.getTime() - parseApiDate(job.summary_started_at).getTime())
+}
+
 export function MetadataItem({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="rounded-md border bg-muted/30 p-3">

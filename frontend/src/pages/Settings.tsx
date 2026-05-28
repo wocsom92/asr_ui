@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Bot, Loader2, Plus, RotateCcw, Save, Terminal, Trash2 } from "lucide-react"
+import { Bot, Brain, Download, Loader2, Plus, RotateCcw, Save, Terminal, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import api from "@/api/client"
 import type {
   CleanupSettingsResponse,
+  SummarizationSettingsResponse,
   TelegramAllowedUser,
   TelegramBotSettingsResponse,
   TelegramBotTestResponse,
@@ -63,6 +64,23 @@ const EMPTY_TELEGRAM_FORM: TelegramBotForm = {
   allowed_users: [],
 }
 
+type SummarizationForm = {
+  enabled: boolean
+  ollama_base_url: string
+  selected_model: string
+  auto_summarize: boolean
+  system_prompt: string
+}
+
+const EMPTY_SUMMARIZATION_FORM: SummarizationForm = {
+  enabled: false,
+  ollama_base_url: "http://ollama:11434",
+  selected_model: "",
+  auto_summarize: false,
+  system_prompt:
+    "You summarize transcripts into concise meeting notes. Include: 1) a short overview, 2) key points, 3) decisions, and 4) action items. Use the transcript language unless the transcript is mixed. Preserve important names, dates, and concrete commitments.",
+}
+
 function buildWhisperCliPreview(config: WhisperCliSettings, executable = "whisper-cli"): string {
   const args = [
     executable,
@@ -98,6 +116,9 @@ export default function Settings() {
   const [newPassword, setNewPassword] = useState("")
   const [whisperForm, setWhisperForm] = useState<WhisperCliSettings>(EMPTY_WHISPER_SETTINGS)
   const [telegramForm, setTelegramForm] = useState<TelegramBotForm>(EMPTY_TELEGRAM_FORM)
+  const [summarizationForm, setSummarizationForm] = useState<SummarizationForm>(EMPTY_SUMMARIZATION_FORM)
+  const [pullModel, setPullModel] = useState("qwen2.5:1.5b")
+  const [customPullModel, setCustomPullModel] = useState("")
   const [cleanupRetentionDays, setCleanupRetentionDays] = useState(7)
 
   const { data: whisperSettings, isLoading: whisperSettingsLoading } = useQuery<WhisperCliSettingsResponse>({
@@ -110,6 +131,12 @@ export default function Settings() {
     queryFn: () => api.get("/system/telegram-bot").then((r) => r.data),
     enabled: user?.role === "admin",
     refetchInterval: user?.role === "admin" ? 10000 : false,
+  })
+  const { data: summarizationSettings, isLoading: summarizationSettingsLoading } = useQuery<SummarizationSettingsResponse>({
+    queryKey: ["system", "summarization"],
+    queryFn: () => api.get("/system/summarization").then((r) => r.data),
+    enabled: user?.role === "admin",
+    refetchInterval: user?.role === "admin" ? 5000 : false,
   })
   const { data: users = [] } = useQuery<User[]>({
     queryKey: ["users"],
@@ -158,6 +185,17 @@ export default function Settings() {
       allowed_users: telegramSettings.allowed_users,
     })
   }, [telegramSettings])
+
+  useEffect(() => {
+    if (!summarizationSettings) return
+    setSummarizationForm({
+      enabled: summarizationSettings.enabled,
+      ollama_base_url: summarizationSettings.ollama_base_url,
+      selected_model: summarizationSettings.selected_model,
+      auto_summarize: summarizationSettings.auto_summarize,
+      system_prompt: summarizationSettings.system_prompt,
+    })
+  }, [summarizationSettings])
 
   useEffect(() => {
     if (!cleanupSettings) return
@@ -221,6 +259,23 @@ export default function Settings() {
     },
     onError: (err: any) => toast.error(err.response?.data?.detail || "Could not save Telegram bot settings"),
   })
+  const updateSummarizationMutation = useMutation({
+    mutationFn: () => api.patch("/system/summarization", summarizationForm),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["system", "summarization"] })
+      toast.success("Summarization settings saved")
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Could not save summarization settings"),
+  })
+  const selectedPullModel = pullModel === "custom" ? customPullModel.trim() : pullModel.trim()
+  const pullSummarizationModelMutation = useMutation({
+    mutationFn: () => api.post("/system/summarization/pull", { model: selectedPullModel }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["system", "summarization"] })
+      toast.success("Ollama model pull started")
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Could not start model pull"),
+  })
   const testTelegramMutation = useMutation({
     mutationFn: () => api.post<TelegramBotTestResponse>("/system/telegram-bot/test"),
     onSuccess: (response) => {
@@ -257,6 +312,12 @@ export default function Settings() {
     value: WhisperCliSettings[K]
   ) => {
     setWhisperForm((current) => ({ ...current, [key]: value }))
+  }
+  const updateSummarizationField = <K extends keyof SummarizationForm>(
+    key: K,
+    value: SummarizationForm[K]
+  ) => {
+    setSummarizationForm((current) => ({ ...current, [key]: value }))
   }
   const whisperCliPreview = buildWhisperCliPreview(
     whisperForm,
@@ -399,6 +460,169 @@ export default function Settings() {
                   <p className="text-xs text-muted-foreground">
                     Last cleanup run deleted {cleanupSettings?.deleted_count_last_run ?? 0} jobs.
                   </p>
+                </>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Brain className="h-4 w-4" />
+                Summarization
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              {summarizationSettingsLoading ? (
+                <div className="flex justify-center py-8">
+                  <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+                </div>
+              ) : (
+                <>
+                  <div className="grid gap-3 rounded-md border bg-muted/20 p-3 text-sm md:grid-cols-2">
+                    <div>
+                      <span className="text-muted-foreground">Ollama:</span>{" "}
+                      <Badge variant={summarizationSettings?.healthy ? "default" : "secondary"}>
+                        {summarizationSettings?.healthy ? "online" : "offline"}
+                      </Badge>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Installed models:</span>{" "}
+                      {summarizationSettings?.models.length ?? 0}
+                    </div>
+                    {summarizationSettings?.health_error && (
+                      <p className="md:col-span-2 text-destructive">{summarizationSettings.health_error}</p>
+                    )}
+                    {summarizationSettings?.pull_status.status !== "idle" && (
+                      <p className="md:col-span-2">
+                        <span className="text-muted-foreground">Pull:</span>{" "}
+                        {summarizationSettings?.pull_status.model} · {summarizationSettings?.pull_status.status}
+                        {summarizationSettings?.pull_status.message ? ` · ${summarizationSettings.pull_status.message}` : ""}
+                        {summarizationSettings?.pull_status.error ? ` · ${summarizationSettings.pull_status.error}` : ""}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="flex items-center justify-between gap-4 rounded-md border bg-muted/20 p-3">
+                      <div>
+                        <Label>Enable summaries</Label>
+                        <p className="text-xs text-muted-foreground">Uses only the local Ollama service.</p>
+                      </div>
+                      <Switch
+                        checked={summarizationForm.enabled}
+                        onCheckedChange={(checked) => updateSummarizationField("enabled", checked)}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-4 rounded-md border bg-muted/20 p-3">
+                      <div>
+                        <Label>Auto-summarize</Label>
+                        <p className="text-xs text-muted-foreground">Queue a summary after each successful transcription.</p>
+                      </div>
+                      <Switch
+                        checked={summarizationForm.auto_summarize}
+                        onCheckedChange={(checked) => updateSummarizationField("auto_summarize", checked)}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Ollama URL</Label>
+                      <Input
+                        value={summarizationForm.ollama_base_url}
+                        onChange={(event) => updateSummarizationField("ollama_base_url", event.currentTarget.value)}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Summary model</Label>
+                      <Select
+                        value={summarizationForm.selected_model || "none"}
+                        onValueChange={(value) => updateSummarizationField("selected_model", value === "none" ? "" : value)}
+                      >
+                        <SelectTrigger><SelectValue placeholder="Select Ollama model" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="none">No model selected</SelectItem>
+                          {(summarizationSettings?.models ?? []).map((model) => (
+                            <SelectItem key={model.name} value={model.name}>
+                              {model.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
+                    <div className="space-y-2">
+                      <Label>Pull Ollama model</Label>
+                      <Select
+                        value={pullModel}
+                        onValueChange={setPullModel}
+                      >
+                        <SelectTrigger><SelectValue placeholder="Choose model to pull" /></SelectTrigger>
+                        <SelectContent>
+                          {(summarizationSettings?.recommended_models ?? []).map((model) => (
+                            <SelectItem key={model} value={model}>
+                              {model}
+                            </SelectItem>
+                          ))}
+                          <SelectItem value="gemma3:1b">gemma3:1b</SelectItem>
+                          <SelectItem value="llama3.2:1b">llama3.2:1b</SelectItem>
+                          <SelectItem value="custom">Custom model name</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      {pullModel === "custom" && (
+                        <Input
+                          value={customPullModel}
+                          onChange={(event) => setCustomPullModel(event.currentTarget.value)}
+                          placeholder="model:tag"
+                        />
+                      )}
+                      <div className="flex flex-wrap gap-2">
+                        {(summarizationSettings?.models ?? []).map((model) => (
+                          <Badge key={model.name} variant="outline">
+                            {model.name}
+                          </Badge>
+                        ))}
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Recommended for Pi 5: qwen2.5:3b for quality, qwen2.5:1.5b for lower memory.
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={pullSummarizationModelMutation.isPending || !selectedPullModel}
+                      onClick={() => pullSummarizationModelMutation.mutate()}
+                    >
+                      {pullSummarizationModelMutation.isPending ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Download className="mr-2 h-4 w-4" />
+                      )}
+                      Pull Model
+                    </Button>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>Summary system prompt</Label>
+                    <Textarea
+                      className="min-h-24"
+                      value={summarizationForm.system_prompt}
+                      onChange={(event) => updateSummarizationField("system_prompt", event.currentTarget.value)}
+                    />
+                  </div>
+
+                  <Button
+                    type="button"
+                    disabled={updateSummarizationMutation.isPending}
+                    onClick={() => updateSummarizationMutation.mutate()}
+                  >
+                    {updateSummarizationMutation.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Save className="mr-2 h-4 w-4" />
+                    )}
+                    Save Summarization
+                  </Button>
                 </>
               )}
             </CardContent>

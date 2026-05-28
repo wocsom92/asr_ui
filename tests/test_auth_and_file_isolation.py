@@ -837,7 +837,17 @@ def test_telegram_bot_settings_are_admin_only_validated_and_masked(monkeypatch):
         assert data["token_preview"] == "1234...CRET"
         assert "bot_token" not in data
         assert data["proxy_url"] == "http://proxy.internal:10809"
-        assert data["allowed_users"] == [{"telegram_user_id": 1001, "app_user_id": admin_id}]
+        assert data["allowed_users"] == [
+            {
+                "telegram_user_id": 1001,
+                "app_user_id": admin_id,
+                "preferred_worker_id": None,
+                "preferred_model_id": None,
+                "split_enabled": None,
+                "split_worker_ids": [],
+                "summarize_enabled": False,
+            }
+        ]
 
         login = client.post(
             "/api/v1/auth/login",
@@ -1008,3 +1018,381 @@ def test_cancel_running_split_job_cancels_queued_chunks_and_returns_cancelling()
         conn.close()
 
         assert [row[0] for row in rows] == ["running", "cancelled"]
+
+
+def test_summarization_settings_defaults_and_update():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+
+        defaults = client.get("/api/v1/system/summarization")
+        assert defaults.status_code == 200
+        assert defaults.json()["ollama_base_url"] == "http://ollama:11434"
+
+        updated = client.patch(
+            "/api/v1/system/summarization",
+            json={
+                "enabled": True,
+                "ollama_base_url": "http://ollama:11434",
+                "selected_model": "qwen2.5:1.5b",
+                "auto_summarize": True,
+                "prompt": "Summarize the transcript into concise notes with key points and action items.",
+            },
+        )
+        assert updated.status_code == 200
+        payload = updated.json()
+        assert payload["enabled"] is True
+        assert payload["selected_model"] == "qwen2.5:1.5b"
+        assert payload["auto_summarize"] is True
+
+
+def test_manual_summary_rejects_unfinished_transcription():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'summary-reject-model', 'Summary Reject Model', 'multilingual', '/models/summary-reject.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'summary-reject.wav', 'summary-reject.wav', 'web', '/tmp/summary-reject.wav', 10, 60)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text, transcript_text)
+            values (?, ?, ?, 'ru', 'running', 'Transcribing', 'partial text')
+            returning id
+            """,
+            (admin_id, audio_id, model_id),
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        response = client.post(f"/api/v1/transcriptions/{job_id}/summary")
+        assert response.status_code == 409
+
+
+def test_cancel_dangling_summary_job():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'summary-cancel-model', 'Summary Cancel Model', 'multilingual', '/models/summary-cancel.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'summary-cancel.wav', 'summary-cancel.wav', 'web', '/tmp/summary-cancel.wav', 10, 60)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text, transcript_text, summary_status)
+            values (?, ?, ?, 'ru', 'succeeded', 'Done', 'Finished text', 'running')
+            returning id
+            """,
+            (admin_id, audio_id, model_id),
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        response = client.post(f"/api/v1/transcriptions/{job_id}/summary/cancel")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["summary_status"] == "cancelled"
+        assert payload["summary_finished_at"] is not None
+
+
+def test_summarize_job_records_success_and_failure(monkeypatch):
+    from app.services import summarizer
+
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        client.patch(
+            "/api/v1/system/summarization",
+            json={
+                "enabled": True,
+                "ollama_base_url": "http://ollama:11434",
+                "selected_model": "qwen2.5:1.5b",
+                "auto_summarize": False,
+                "prompt": "Summarize the transcript into concise notes with key points and action items.",
+            },
+        )
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'summary-ok-model', 'Summary OK Model', 'multilingual', '/models/summary-ok.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'summary-ok.wav', 'summary-ok.wav', 'web', '/tmp/summary-ok.wav', 10, 60)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text, transcript_text)
+            values (?, ?, ?, 'ru', 'succeeded', 'Done', 'Обсудили план и задачи.')
+            returning id
+            """,
+            (admin_id, audio_id, model_id),
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        async def fake_summary(_config, _text):
+            return "Краткое резюме."
+
+        monkeypatch.setattr(summarizer, "_summarize_text", fake_summary)
+        asyncio.run(summarizer.summarize_job(job_id))
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        row = conn.execute(
+            "select status, summary_status, summary_text, summary_model from transcription_jobs where id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.close()
+        assert row == ("succeeded", "succeeded", "Краткое резюме.", "qwen2.5:1.5b")
+
+        async def failing_summary(_config, _text):
+            raise RuntimeError("ollama unavailable")
+
+        monkeypatch.setattr(summarizer, "_summarize_text", failing_summary)
+        asyncio.run(summarizer.summarize_job(job_id))
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        row = conn.execute(
+            "select status, summary_status, summary_error from transcription_jobs where id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.close()
+        assert row[0] == "succeeded"
+        assert row[1] == "failed"
+        assert "ollama unavailable" in row[2]
+
+
+def test_telegram_requested_summary_is_sent_when_ready(monkeypatch):
+    from app.services import summarizer
+    from app.services import telegram_bot
+
+    sent_documents = []
+
+    class FakeTelegramResponse:
+        status_code = 200
+        text = "ok"
+
+    async def fake_summary(_config, _text):
+        return "Telegram summary text."
+
+    async def fake_telegram_request(_config, _http_method, api_method, **kwargs):
+        if api_method == "sendDocument":
+            sent_documents.append(kwargs)
+        return FakeTelegramResponse()
+
+    monkeypatch.setattr(summarizer, "_summarize_text", fake_summary)
+    monkeypatch.setattr(telegram_bot, "telegram_api_request", fake_telegram_request)
+
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "password1"},
+        )
+        assert login.status_code == 200
+        admin_id = login.json()["user"]["id"]
+
+        client.patch(
+            "/api/v1/system/summarization",
+            json={
+                "enabled": True,
+                "ollama_base_url": "http://ollama:11434",
+                "selected_model": "qwen2.5:1.5b",
+                "auto_summarize": False,
+                "prompt": "Summarize the transcript into concise notes with key points and action items.",
+            },
+        )
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        conn.execute(
+            """
+            insert into app_settings (key, value)
+            values ('telegram_bot_settings', ?)
+            on conflict(key) do update set value = excluded.value
+            """,
+            (json.dumps({"bot_token": "123456:SECRET"}),),
+        )
+        model_id = conn.execute(
+            """
+            insert into transcription_models
+            (provider, variant, display_name, language_mode, path, status, downloaded_bytes, is_deleted)
+            values ('whisper.cpp', 'telegram-summary-model', 'Telegram Summary Model', 'multilingual', '/models/telegram-summary.bin', 'installed', 0, 0)
+            returning id
+            """
+        ).fetchone()[0]
+        audio_id = conn.execute(
+            """
+            insert into audio_files
+            (owner_user_id, original_filename, display_name, source, stored_path, size_bytes, duration_seconds)
+            values (?, 'telegram-summary.wav', 'telegram-summary.wav', 'telegram', '/tmp/telegram-summary.wav', 10, 60)
+            returning id
+            """,
+            (admin_id,),
+        ).fetchone()[0]
+        job_id = conn.execute(
+            """
+            insert into transcription_jobs
+            (owner_user_id, audio_file_id, model_id, language, status, status_text, transcript_text,
+             source, telegram_chat_id, telegram_summary_requested)
+            values (?, ?, ?, 'ru', 'succeeded', 'Done', 'Discussed the launch plan.',
+                    'telegram', '1001', 1)
+            returning id
+            """,
+            (admin_id, audio_id, model_id),
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        asyncio.run(summarizer.summarize_job(job_id))
+
+        assert len(sent_documents) == 1
+        document = sent_documents[0]
+        assert document["data"] == {
+            "chat_id": "1001",
+            "caption": f"Summary for transcription job #{job_id}.",
+        }
+        assert document["files"] == {
+            "document": (
+                f"summary_{job_id}.txt",
+                b"Telegram summary text.",
+                "text/plain; charset=utf-8",
+            )
+        }
+
+        conn = sqlite3.connect(TEST_ROOT / "test.db")
+        row = conn.execute(
+            "select telegram_summary_sent_at, telegram_summary_error from transcription_jobs where id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.close()
+        assert row[0] is not None
+        assert row[1] is None
+
+
+def test_long_transcripts_are_chunked(monkeypatch):
+    from app.schemas.summarization_settings import SummarizationSettings
+    from app.services import summarizer
+
+    calls = []
+
+    async def fake_generate(_config, prompt):
+        calls.append(prompt)
+        return f"summary {len(calls)}"
+
+    monkeypatch.setattr(summarizer, "_CHUNK_CHAR_LIMIT", 50)
+    monkeypatch.setattr(summarizer, "_ollama_generate", fake_generate)
+    config = SummarizationSettings(enabled=True, selected_model="qwen2.5:1.5b")
+    text = "\n".join(["one two three four five six seven eight nine ten"] * 8)
+
+    result = asyncio.run(summarizer._summarize_text(config, text))
+
+    assert result == f"summary {len(calls)}"
+    assert len(calls) > 2
+
+
+def test_ollama_request_uses_bounded_context_and_prediction(monkeypatch):
+    from app.schemas.summarization_settings import SummarizationSettings
+    from app.services import summarizer
+
+    captured = {}
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"response": "Bounded summary"}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, path, json):
+            captured["path"] = path
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(summarizer.httpx, "AsyncClient", FakeClient)
+
+    config = SummarizationSettings(enabled=True, selected_model="qwen2.5:1.5b")
+    result = asyncio.run(summarizer._ollama_generate(config, "Transcript"))
+
+    assert result == "Bounded summary"
+    assert captured["path"] == "/api/generate"
+    assert captured["json"]["options"]["num_ctx"] == 4096
+    assert captured["json"]["options"]["num_predict"] == 512
+    assert captured["client_kwargs"]["timeout"].timeout == 900
+
+
+def test_summary_timeout_error_is_not_empty():
+    from app.services import summarizer
+
+    assert summarizer._summary_error_message(summarizer.httpx.ReadTimeout("")) == (
+        "Ollama request timed out after 900 seconds"
+    )

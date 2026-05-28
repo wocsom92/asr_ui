@@ -19,6 +19,7 @@ from app.services.job_cancellation import dispose_job_cancel_event, prepare_job_
 from app.services.model_catalog import get_catalog_item, model_storage_path
 from app.services.model_installer import install_model
 from app.services.telegram_bot import notify_transcription_finished
+from app.services.summarizer import queue_summary_if_enabled
 from app.services.transcriber import TranscriptionCancelled, transcribe_audio
 from app.schemas.workers import WorkerHeartbeatIn, WorkerModelState
 from app.services.worker_runtime import (
@@ -466,6 +467,8 @@ async def _process_claimed_job(job_id: int, worker_name: str) -> None:
             finally:
                 job.finished_at = datetime.now(timezone.utc)
                 await db.commit()
+                if job.status == "succeeded":
+                    await queue_summary_if_enabled(job.id)
                 await notify_transcription_finished(job)
                 runtime = _runtime_seconds(job.started_at, job.finished_at)
                 await _record_worker_finished(
