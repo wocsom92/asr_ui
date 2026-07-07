@@ -7,6 +7,7 @@ import type {
   SummarizationSettingsResponse,
   TranscriptionJob,
   TranscriptionModel,
+  TranscriptionStats,
   TranscriptionWorker,
 } from "@/types"
 import { Badge } from "@/components/ui/badge"
@@ -38,7 +39,12 @@ export default function Dashboard() {
   const { data: jobs = [] } = useQuery<TranscriptionJob[]>({
     queryKey: ["transcriptions"],
     queryFn: () => api.get("/transcriptions").then((r) => r.data),
-    refetchInterval: 5000,
+    refetchInterval: 30000,
+  })
+  const { data: stats } = useQuery<TranscriptionStats>({
+    queryKey: ["transcriptions", "stats"],
+    queryFn: () => api.get("/transcriptions/stats").then((r) => r.data),
+    refetchInterval: 30000,
   })
   const { data: models = [] } = useQuery<TranscriptionModel[]>({
     queryKey: ["models"],
@@ -61,31 +67,18 @@ export default function Dashboard() {
 
   const storage = files.reduce((sum, file) => sum + file.size_bytes, 0)
   const audioDuration = files.reduce((sum, file) => sum + (file.duration_seconds ?? 0), 0)
-  const finishedJobs = jobs.filter((j) => j.status === "succeeded")
-  const transcriptStorage = finishedJobs.reduce(
-    (sum, job) =>
-      sum +
-      (job.output_txt_size_bytes ?? 0) +
-      (job.output_json_size_bytes ?? 0) +
-      (job.output_srt_size_bytes ?? 0) +
-      (job.output_vtt_size_bytes ?? 0),
-    0
-  )
-  const completedSummaries = jobs.filter((job) => job.summary_status === "succeeded" && job.summary_text)
-  const activeSummaryJobs = jobs.filter((job) => job.summary_status === "queued" || job.summary_status === "running")
-  const failedSummaryJobs = jobs.filter((job) => job.summary_status === "failed")
-  const activeTranscriptionJobs = jobs.filter((job) => job.status === "queued" || job.status === "running")
-  const activeQueueCount = activeTranscriptionJobs.length + activeSummaryJobs.length
-  const summaryCoverage = finishedJobs.length > 0
-    ? Math.round((completedSummaries.length / finishedJobs.length) * 100)
+  const finishedCount = stats?.finished ?? 0
+  const transcriptStorage = stats?.transcript_storage_bytes ?? 0
+  const completedSummariesCount = stats?.completed_summaries ?? 0
+  const activeSummaryCount = stats?.active_summaries ?? 0
+  const failedSummaryCount = stats?.failed_summaries ?? 0
+  const activeTranscriptionCount = stats?.active_transcriptions ?? 0
+  const activeQueueCount = activeTranscriptionCount + activeSummaryCount
+  const summaryCoverage = finishedCount > 0
+    ? Math.round((completedSummariesCount / finishedCount) * 100)
     : 0
-  const summaryWordCount = completedSummaries.reduce(
-    (sum, job) => sum + (job.summary_text?.trim().split(/\s+/).filter(Boolean).length ?? 0),
-    0
-  )
-  const averageSummaryWords = completedSummaries.length > 0
-    ? Math.round(summaryWordCount / completedSummaries.length)
-    : 0
+  const summaryWordCount = stats?.summary_word_count ?? 0
+  const averageSummaryWords = stats?.average_summary_words ?? 0
   const recent = jobs.slice(0, 8)
   const installedModels = models.filter((model) => model.status === "installed")
   const installedSummaryModels = summarizationSettings?.models ?? []
@@ -138,7 +131,7 @@ export default function Dashboard() {
               <AudioLines className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{finishedJobs.length}</div>
+              <div className="text-2xl font-bold">{finishedCount}</div>
               <p className="text-xs text-muted-foreground">
                 {formatBytes(transcriptStorage)} generated
               </p>
@@ -152,7 +145,7 @@ export default function Dashboard() {
             <CardContent>
               <div className="text-2xl font-bold">{activeQueueCount}</div>
               <p className="text-xs text-muted-foreground">
-                {activeTranscriptionJobs.length} transcriptions · {activeSummaryJobs.length} summaries
+                {activeTranscriptionCount} transcriptions · {activeSummaryCount} summaries
               </p>
             </CardContent>
           </Card>
@@ -162,7 +155,7 @@ export default function Dashboard() {
               <Brain className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{completedSummaries.length}</div>
+              <div className="text-2xl font-bold">{completedSummariesCount}</div>
               <p className="text-xs text-muted-foreground">
                 {summaryCoverage}% of finished transcriptions
               </p>
@@ -176,7 +169,7 @@ export default function Dashboard() {
             <CardContent>
               <div className="text-2xl font-bold">{compactNumber(summaryWordCount)}</div>
               <p className="text-xs text-muted-foreground">
-                {failedSummaryJobs.length} failed · {averageSummaryWords > 0 ? `${compactNumber(averageSummaryWords)} avg words` : "no generated summaries"}
+                {failedSummaryCount} failed · {averageSummaryWords > 0 ? `${compactNumber(averageSummaryWords)} avg words` : "no generated summaries"}
               </p>
             </CardContent>
           </Card>

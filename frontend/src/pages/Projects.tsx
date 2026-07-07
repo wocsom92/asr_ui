@@ -4,6 +4,7 @@ import { FileAudio, Folder, FolderOpen, Loader2, Pencil, Plus, Trash2, X } from 
 import { toast } from "sonner"
 
 import api from "@/api/client"
+import { useConfirm } from "@/components/ConfirmDialog"
 import { ProjectBadge } from "@/components/ProjectBadge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -14,6 +15,7 @@ import type { Project } from "@/types"
 
 export default function Projects() {
   const qc = useQueryClient()
+  const confirm = useConfirm()
   const [projectName, setProjectName] = useState("")
   const [projectDescription, setProjectDescription] = useState("")
   const [editingProjectId, setEditingProjectId] = useState<number | null>(null)
@@ -206,10 +208,14 @@ export default function Projects() {
                               size="icon"
                               variant="outline"
                               className="border-destructive/40 text-destructive hover:bg-destructive/10"
-                              onClick={() => {
-                                if (window.confirm("Delete this project? Audio files and transcriptions will become Unassigned.")) {
-                                  deleteProjectMutation.mutate(project.id)
-                                }
+                              onClick={async () => {
+                                const ok = await confirm({
+                                  title: "Delete project?",
+                                  description: "Audio files and transcriptions in this project will become Unassigned.",
+                                  confirmLabel: "Delete",
+                                  destructive: true,
+                                })
+                                if (ok) deleteProjectMutation.mutate(project.id)
                               }}
                             >
                               <Trash2 className="h-4 w-4" />

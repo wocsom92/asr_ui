@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth.deps import require_admin
 from app.config import settings
+from app.services.event_bus import emit_job_event, emit_worker_event
 from app.database import get_db
 from app.models.audio_file import AudioFile
 from app.models.transcription_job import TranscriptionJob
@@ -65,7 +67,7 @@ def _require_worker_token(
     supplied = x_asr_worker_token
     if not supplied and authorization and authorization.startswith("Bearer "):
         supplied = authorization[7:]
-    if not expected or supplied != expected:
+    if not expected or not supplied or not secrets.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="Invalid worker token")
 
 
@@ -456,6 +458,8 @@ async def finish_job(
         job.model.variant if job.model else None,
     )
     await db.commit()
+    emit_job_event(job.owner_user_id, job.id)
+    emit_worker_event()
     if job.status == "succeeded":
         await queue_summary_if_enabled(job.id)
     return {"ok": True}
@@ -499,6 +503,8 @@ async def finish_chunk(
     )
     await db.commit()
     await try_merge_split_job(db, chunk.parent_job_id)
+    emit_job_event(chunk.parent_job.owner_user_id if chunk.parent_job else None, chunk.parent_job_id)
+    emit_worker_event()
     return {"ok": True}
 
 

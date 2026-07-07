@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Float, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -17,9 +17,9 @@ class TranscriptionJobChunk(Base):
     index: Mapped[int] = mapped_column(Integer)
     start_seconds: Mapped[float] = mapped_column(Float)
     end_seconds: Mapped[float] = mapped_column(Float)
-    overlap_start_seconds: Mapped[float] = mapped_column(Float, default=0.0)
-    overlap_end_seconds: Mapped[float] = mapped_column(Float, default=0.0)
-    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    overlap_start_seconds: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0"))
+    overlap_end_seconds: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0"))
+    status: Mapped[str] = mapped_column(String(20), default="queued", server_default="queued", index=True)
     status_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     worker_id: Mapped[Optional[int]] = mapped_column(ForeignKey("transcription_workers.id"), nullable=True, index=True)

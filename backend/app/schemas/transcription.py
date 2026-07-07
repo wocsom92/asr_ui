@@ -38,7 +38,9 @@ class TranscriptionJobChunkOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class TranscriptionJobOut(BaseModel):
+class TranscriptionJobBaseOut(BaseModel):
+    """Shared job fields for list and detail responses."""
+
     id: int
     owner_user_id: int
     audio_file_id: int
@@ -47,15 +49,12 @@ class TranscriptionJobOut(BaseModel):
     status: str
     status_text: Optional[str]
     error_message: Optional[str]
-    transcript_text: Optional[str]
     output_txt_size_bytes: Optional[int] = None
     output_json_size_bytes: Optional[int] = None
     output_srt_size_bytes: Optional[int] = None
     output_vtt_size_bytes: Optional[int] = None
     partial_transcript_text: Optional[str] = None
-    partial_transcript_json: Optional[str] = None
     partial_updated_at: Optional[datetime] = None
-    summary_text: Optional[str] = None
     summary_status: str = "idle"
     summary_error: Optional[str] = None
     summary_model: Optional[str] = None
@@ -99,7 +98,50 @@ class TranscriptionJobOut(BaseModel):
     model_config = {"from_attributes": True, "protected_namespaces": ()}
 
 
+class TranscriptionJobListOut(TranscriptionJobBaseOut):
+    """Slim list payload: omits large TEXT blobs that are deferred in list queries.
+
+    Must stay in sync with ``_LIST_DEFERRED_FIELDS`` in the transcriptions router.
+    Using a separate schema prevents Pydantic from lazy-loading deferred columns
+    during response validation (which causes MissingGreenlet 500 errors).
+    """
+
+
+class TranscriptionJobOut(TranscriptionJobBaseOut):
+    transcript_text: Optional[str]
+    partial_transcript_json: Optional[str] = None
+    summary_text: Optional[str] = None
+
+
 class TranscriptionSegmentOut(BaseModel):
     start: float
     end: float
     text: str
+    speaker: Optional[str] = None
+
+
+class SegmentEdit(BaseModel):
+    start: float
+    end: float
+    text: str
+    speaker: Optional[str] = None
+
+
+class SegmentsUpdate(BaseModel):
+    segments: list[SegmentEdit] = []
+
+
+class BulkIdsRequest(BaseModel):
+    ids: list[int] = []
+
+
+class TranscriptionStatsOut(BaseModel):
+    total: int = 0
+    finished: int = 0
+    active_transcriptions: int = 0
+    active_summaries: int = 0
+    failed_summaries: int = 0
+    completed_summaries: int = 0
+    transcript_storage_bytes: int = 0
+    summary_word_count: int = 0
+    average_summary_words: int = 0

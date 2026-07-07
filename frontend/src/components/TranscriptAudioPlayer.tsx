@@ -13,6 +13,7 @@ interface TranscriptSegment {
   start: number
   end: number
   text: string
+  speaker?: string | null
 }
 
 interface TranscriptAudioPlayerProps {
@@ -314,7 +315,14 @@ export function TranscriptAudioPlayer({
                     <span className={cn("text-xs", active ? "text-primary-foreground/80" : "text-muted-foreground")}>
                       {formatClock(segment.start)}
                     </span>
-                    <span>{renderSegmentText(segment.text, searchMatches, activeMatchIndex, index)}</span>
+                    <span>
+                      {segment.speaker && (
+                        <span className={cn("mr-1 font-semibold", active ? "text-primary-foreground" : "text-primary")}>
+                          {segment.speaker}:
+                        </span>
+                      )}
+                      {renderSegmentText(segment.text, searchMatches, activeMatchIndex, index)}
+                    </span>
                   </button>
                 )
               })}

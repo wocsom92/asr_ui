@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, ForeignKey, String, Text, false, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -31,7 +31,7 @@ class TranscriptionJob(Base):
     partial_transcript_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     partial_updated_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     summary_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    summary_status: Mapped[str] = mapped_column(String(20), default="idle", index=True)
+    summary_status: Mapped[str] = mapped_column(String(20), default="idle", server_default="idle", index=True)
     summary_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     summary_model: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     summary_queued_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
@@ -45,7 +45,7 @@ class TranscriptionJob(Base):
     telegram_file_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     telegram_result_sent_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     telegram_result_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    telegram_summary_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    telegram_summary_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     telegram_summary_sent_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     telegram_summary_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     worker_id: Mapped[Optional[int]] = mapped_column(ForeignKey("transcription_workers.id"), nullable=True, index=True)
@@ -56,7 +56,7 @@ class TranscriptionJob(Base):
     claimed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     worker_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     cancel_requested_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
-    split_enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    split_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), index=True)
     split_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     started_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)

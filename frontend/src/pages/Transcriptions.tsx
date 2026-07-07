@@ -1,21 +1,26 @@
 import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Ban, Brain, ChevronDown, ChevronRight, Copy, Download, Loader2, Trash2 } from "lucide-react"
+import { ChevronDown, ChevronRight, Download, Loader2, Pencil, Trash2 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 
 import api from "@/api/client"
+import { useConfirm } from "@/components/ConfirmDialog"
 import { PaginationControls } from "@/components/PaginationControls"
 import { ProjectBadge } from "@/components/ProjectBadge"
+import { SummaryPanel } from "@/components/SummaryPanel"
 import { TranscriptAudioPlayer } from "@/components/TranscriptAudioPlayer"
+import { TranscriptEditor } from "@/components/TranscriptEditor"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { useDebouncedValue } from "@/hooks/useDebouncedValue"
 import { audioTitle } from "@/lib/audio"
 import { formatDateTimeLocal } from "@/lib/datetime"
 import { formatBytes, formatDuration } from "@/lib/format"
-import { jobRuntime, MetadataItem, summaryRuntime } from "@/lib/jobs"
+import { jobRuntime, MetadataItem } from "@/lib/jobs"
 import type { Project, TranscriptionJob } from "@/types"
 
 const PAGE_SIZE = 20
@@ -29,20 +34,34 @@ const TRANSCRIPT_OUTPUTS = [
 
 export default function Transcriptions() {
   const qc = useQueryClient()
+  const confirm = useConfirm()
   const [searchParams] = useSearchParams()
   const [expandedId, setExpandedId] = useState<number | null>(null)
+  const [editingId, setEditingId] = useState<number | null>(null)
   const [page, setPage] = useState(1)
   const [projectFilter, setProjectFilter] = useState("all")
-  const projectParams =
-    projectFilter === "all" ? undefined : { project_id: projectFilter }
-  const { data: jobs = [], isLoading } = useQuery<TranscriptionJob[]>({
-    queryKey: ["transcriptions", projectFilter],
-    queryFn: () => api.get("/transcriptions", { params: projectParams }).then((r) => r.data),
-    refetchInterval: 5000,
+  const [search, setSearch] = useState("")
+  const debouncedSearch = useDebouncedValue(search.trim(), 300)
+  const listParams = {
+    ...(projectFilter === "all" ? {} : { project_id: projectFilter }),
+    ...(debouncedSearch ? { q: debouncedSearch } : {}),
+  }
+  const { data: jobs = [], isLoading, isError, refetch } = useQuery<TranscriptionJob[]>({
+    queryKey: ["transcriptions", projectFilter, debouncedSearch],
+    queryFn: () => api.get("/transcriptions", { params: listParams }).then((r) => r.data),
+    refetchInterval: 20000,
   })
   const { data: projects = [], isLoading: projectsLoading } = useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: () => api.get("/projects").then((r) => r.data),
+  })
+  // The list payload omits the large transcript/summary text; fetch the full record
+  // for the currently expanded row only.
+  const { data: expandedDetail } = useQuery<TranscriptionJob>({
+    queryKey: ["transcriptions", "detail", expandedId],
+    queryFn: () => api.get(`/transcriptions/${expandedId}`).then((r) => r.data),
+    enabled: expandedId !== null,
+    refetchInterval: 30000,
   })
   useEffect(() => {
     if (projectsLoading || projectFilter === "all" || projectFilter === "none") return
@@ -94,10 +113,11 @@ export default function Transcriptions() {
   const summaryMutation = useMutation({
     mutationFn: (jobId: number) => api.post<TranscriptionJob>(`/transcriptions/${jobId}/summary`).then((r) => r.data),
     onSuccess: (updated) => {
-      qc.setQueryData<TranscriptionJob[]>(["transcriptions", projectFilter], (prev) =>
+      qc.setQueryData<TranscriptionJob[]>(["transcriptions", projectFilter, debouncedSearch], (prev) =>
         prev ? prev.map((job) => (job.id === updated.id ? updated : job)) : prev
       )
       void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      void qc.invalidateQueries({ queryKey: ["transcriptions", "detail"] })
       toast.success("Summary queued")
     },
     onError: (err: unknown) => {
@@ -110,10 +130,11 @@ export default function Transcriptions() {
     mutationFn: (jobId: number) =>
       api.post<TranscriptionJob>(`/transcriptions/${jobId}/summary/cancel`).then((r) => r.data),
     onSuccess: (updated) => {
-      qc.setQueryData<TranscriptionJob[]>(["transcriptions", projectFilter], (prev) =>
+      qc.setQueryData<TranscriptionJob[]>(["transcriptions", projectFilter, debouncedSearch], (prev) =>
         prev ? prev.map((job) => (job.id === updated.id ? updated : job)) : prev
       )
       void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      void qc.invalidateQueries({ queryKey: ["transcriptions", "detail"] })
       toast.success("Summary cancelled")
     },
     onError: (err: unknown) => {
@@ -133,23 +154,43 @@ export default function Transcriptions() {
           <h1 className="text-3xl font-bold tracking-tight">Transcriptions</h1>
           <p className="text-muted-foreground">Finished transcripts, text viewer, and downloads.</p>
         </div>
-        <Select value={projectFilter} onValueChange={setProjectFilter}>
-          <SelectTrigger className="w-full sm:w-48">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All projects</SelectItem>
-            <SelectItem value="none">Unassigned</SelectItem>
-            {projects.map((project) => (
-              <SelectItem key={project.id} value={String(project.id)}>
-                {project.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Input
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value)
+              setPage(1)
+            }}
+            placeholder="Search by file name…"
+            className="w-full sm:w-64"
+          />
+          <Select value={projectFilter} onValueChange={setProjectFilter}>
+            <SelectTrigger className="w-full sm:w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All projects</SelectItem>
+              <SelectItem value="none">Unassigned</SelectItem>
+              {projects.map((project) => (
+                <SelectItem key={project.id} value={String(project.id)}>
+                  {project.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       </div>
 
-      {isLoading ? (
+      {isError ? (
+        <Card>
+          <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
+            <p className="text-sm text-muted-foreground">Could not load transcriptions.</p>
+            <Button variant="outline" size="sm" onClick={() => refetch()}>
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      ) : isLoading ? (
         <div className="flex justify-center py-12">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
@@ -170,8 +211,12 @@ export default function Transcriptions() {
             onPageChange={setPage}
           />
 
-          {pagedJobs.map((job) => {
-            const expanded = expandedId === job.id
+          {pagedJobs.map((listJob) => {
+            const expanded = expandedId === listJob.id
+            const job =
+              expanded && expandedDetail && expandedDetail.id === listJob.id
+                ? { ...listJob, ...expandedDetail }
+                : listJob
             const isFinal = job.status === "succeeded"
             const transcriptText = isFinal ? job.transcript_text : job.partial_transcript_text
 
@@ -274,91 +319,37 @@ export default function Transcriptions() {
                       />
                     </div>
 
-                    <TranscriptAudioPlayer
-                      job={job}
-                      source={isFinal ? "auto" : "partial"}
-                      title={isFinal ? "Live transcript" : "Partial transcript"}
-                    />
+                    {isFinal && (
+                      <div className="flex justify-end">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setEditingId((current) => (current === job.id ? null : job.id))}
+                        >
+                          <Pencil className="mr-2 h-3 w-3" />
+                          {editingId === job.id ? "Close editor" : "Edit transcript"}
+                        </Button>
+                      </div>
+                    )}
+
+                    {isFinal && editingId === job.id ? (
+                      <TranscriptEditor jobId={job.id} onClose={() => setEditingId(null)} />
+                    ) : (
+                      <TranscriptAudioPlayer
+                        job={job}
+                        source={isFinal ? "auto" : "partial"}
+                        title={isFinal ? "Live transcript" : "Partial transcript"}
+                      />
+                    )}
 
                     {isFinal && (
-                      <div className="space-y-3 rounded-md border bg-muted/20 p-3">
-                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                          <div className="min-w-0">
-                            <h3 className="flex items-center gap-2 text-sm font-semibold">
-                              <Brain className="h-4 w-4" />
-                              Summary
-                            </h3>
-                            <p className="mt-1 text-xs text-muted-foreground">
-                              {job.summary_model ? `${job.summary_model} · ` : ""}
-                              {job.summary_status || "idle"}
-                              {job.summary_started_at ? ` · runtime ${summaryRuntime(job)}` : ""}
-                              {job.summary_updated_at ? ` · updated ${formatDateTimeLocal(job.summary_updated_at)}` : ""}
-                            </p>
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            {job.summary_text && (
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={() => {
-                                  navigator.clipboard.writeText(job.summary_text ?? "")
-                                  toast.success("Summary copied")
-                                }}
-                              >
-                                <Copy className="mr-2 h-3 w-3" />
-                                Copy
-                              </Button>
-                            )}
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              disabled={summaryMutation.isPending || job.summary_status === "queued" || job.summary_status === "running"}
-                              onClick={() => summaryMutation.mutate(job.id)}
-                            >
-                              {summaryMutation.isPending ? (
-                                <Loader2 className="mr-2 h-3 w-3 animate-spin" />
-                              ) : (
-                                <Brain className="mr-2 h-3 w-3" />
-                              )}
-                              {job.summary_text ? "Regenerate" : "Generate"}
-                            </Button>
-                            {(job.summary_status === "queued" || job.summary_status === "running") && (
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                disabled={cancelSummaryMutation.isPending}
-                                onClick={() => cancelSummaryMutation.mutate(job.id)}
-                              >
-                                {cancelSummaryMutation.isPending ? (
-                                  <Loader2 className="mr-2 h-3 w-3 animate-spin" />
-                                ) : (
-                                  <Ban className="mr-2 h-3 w-3" />
-                                )}
-                                Cancel
-                              </Button>
-                            )}
-                          </div>
-                        </div>
-                        {job.summary_error && (
-                          <p className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
-                            {job.summary_error}
-                          </p>
-                        )}
-                        {job.summary_text ? (
-                          <div className="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-background p-3 text-sm leading-relaxed">
-                            {job.summary_text}
-                          </div>
-                        ) : (
-                          <p className="rounded-md bg-background p-3 text-sm text-muted-foreground">
-                            {job.summary_status === "queued" || job.summary_status === "running"
-                              ? "Summary is being generated."
-                              : "No summary generated yet."}
-                          </p>
-                        )}
-                      </div>
+                      <SummaryPanel
+                        job={job}
+                        onGenerate={(id) => summaryMutation.mutate(id)}
+                        onCancel={(id) => cancelSummaryMutation.mutate(id)}
+                        generating={summaryMutation.isPending}
+                        cancelling={cancelSummaryMutation.isPending}
+                      />
                     )}
 
                     <div className="flex flex-wrap gap-2">
@@ -375,10 +366,14 @@ export default function Transcriptions() {
                         variant="outline"
                         disabled={deleteMutation.isPending || job.status === "running"}
                         className="border-destructive/40 text-destructive hover:bg-destructive/10"
-                        onClick={() => {
-                          if (window.confirm("Delete this transcription and all generated output files?")) {
-                            deleteMutation.mutate(job.id)
-                          }
+                        onClick={async () => {
+                          const ok = await confirm({
+                            title: "Delete transcription?",
+                            description: "This transcription and all generated output files will be permanently deleted.",
+                            confirmLabel: "Delete",
+                            destructive: true,
+                          })
+                          if (ok) deleteMutation.mutate(job.id)
                         }}
                       >
                         <Trash2 className="mr-2 h-4 w-4" />

@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:8824"]
+    # Set true behind HTTPS so auth cookies are only sent over TLS. Left false by default
+    # for plain-HTTP LAN deployments.
+    cookie_secure: bool = False
+    cookie_samesite: str = "lax"
+    # When true the app refuses to start with the placeholder SECRET_KEY. Default false so
+    # existing trusted-LAN deployments keep working; flip on for any exposed instance.
+    require_secure_secret_key: bool = False
+    # Basic brute-force throttle on /auth/login (per username+client).
+    login_rate_limit_attempts: int = 10
+    login_rate_limit_window_seconds: int = 300
 
     data_dir: Path = Path("/data")
     uploads_dir: Path = Path("/data/uploads")
@@ -51,6 +61,13 @@ class Settings(BaseSettings):
     gigaam_torch_threads: Optional[int] = None
     gigaam_torch_interop_threads: Optional[int] = None
     summarization_ollama_base_url: str = "http://ollama:11434"
+
+    # Opt-in speaker diarization (pyannote.audio). Disabled by default because it pulls in
+    # torch + a gated Hugging Face model and is heavy on low-power hosts like a Raspberry Pi.
+    # When enabled, finished single-worker transcripts get a speaker label per segment.
+    diarization_enabled: bool = False
+    diarization_model: str = "pyannote/speaker-diarization-3.1"
+    huggingface_token: Optional[str] = None
 
     model_config = {
         "env_file": ".env",

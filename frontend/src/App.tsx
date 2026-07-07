@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { useEffect } from "react"
 import { Toaster } from "sonner"
 import { useAuthStore } from "@/stores/auth"
+import { ConfirmProvider } from "@/components/ConfirmDialog"
 import { AppShell } from "@/components/layout/AppShell"
 import Dashboard from "@/pages/Dashboard"
 import Files from "@/pages/Files"
@@ -32,6 +33,7 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <AuthLoader>
+          <ConfirmProvider>
           <Routes>
             <Route path="/login" element={<Login />} />
             <Route element={<AppShell />}>
@@ -47,6 +49,7 @@ export default function App() {
             </Route>
           </Routes>
           <Toaster richColors position="top-right" />
+          </ConfirmProvider>
         </AuthLoader>
       </BrowserRouter>
     </QueryClientProvider>

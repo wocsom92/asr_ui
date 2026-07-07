@@ -1,6 +1,7 @@
 import { useNavigate } from "react-router-dom"
-import { LogOut, User as UserIcon } from "lucide-react"
+import { LogOut, Moon, Sun, User as UserIcon } from "lucide-react"
 import { useAuthStore } from "@/stores/auth"
+import { useThemeStore } from "@/stores/theme"
 import { MobileNav } from "./MobileNav"
 import { Button } from "@/components/ui/button"
 import {
@@ -15,6 +16,8 @@ import { Badge } from "@/components/ui/badge"
 
 export function Header() {
   const { user, logout } = useAuthStore()
+  const theme = useThemeStore((s) => s.theme)
+  const toggleTheme = useThemeStore((s) => s.toggleTheme)
   const navigate = useNavigate()
 
   const handleLogout = async () => {
@@ -26,6 +29,15 @@ export function Header() {
     <header className="sticky top-0 z-40 flex h-16 items-center gap-4 border-b bg-background px-4 md:px-6">
       <MobileNav />
       <div className="flex-1" />
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={toggleTheme}
+        aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+      >
+        {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+      </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="ghost" className="flex items-center gap-2">

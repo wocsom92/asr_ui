@@ -4,6 +4,7 @@ import { Brain, Cpu, Download, Gauge, Loader2, Square, Trash2 } from "lucide-rea
 import { toast } from "sonner"
 import api from "@/api/client"
 import type { ModelCatalogItem, ModelStats, SummarizationSettingsResponse, TranscriptionModel, TranscriptionWorker } from "@/types"
+import { useConfirm } from "@/components/ConfirmDialog"
 import { useAuthStore } from "@/stores/auth"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -82,6 +83,7 @@ function installedWorkerVariant(worker: TranscriptionWorker, item: ModelCatalogI
 export default function Models() {
   const user = useAuthStore((s) => s.user)
   const qc = useQueryClient()
+  const confirm = useConfirm()
   const [summaryPullModel, setSummaryPullModel] = useState("qwen2.5:1.5b")
   const { data: catalog = [], isLoading: catalogLoading } = useQuery<ModelCatalogItem[]>({
     queryKey: ["models", "catalog"],
@@ -258,10 +260,15 @@ export default function Models() {
                   variant="outline"
                   size="sm"
                   disabled={disabled || !installedVariant}
-                  onClick={() => {
-                    if (installedVariant && window.confirm(`Uninstall ${installedVariant} from ${workerLabel(worker)}?`)) {
-                      workerUninstallMutation.mutate({ workerId: worker.id, variant: installedVariant })
-                    }
+                  onClick={async () => {
+                    if (!installedVariant) return
+                    const ok = await confirm({
+                      title: "Uninstall model?",
+                      description: `${installedVariant} will be removed from ${workerLabel(worker)}.`,
+                      confirmLabel: "Uninstall",
+                      destructive: true,
+                    })
+                    if (ok) workerUninstallMutation.mutate({ workerId: worker.id, variant: installedVariant })
                   }}
                 >
                   <Trash2 className="mr-2 h-3 w-3" />

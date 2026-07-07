@@ -1,10 +1,12 @@
 import { Outlet, Navigate } from "react-router-dom"
 import { useAuthStore } from "@/stores/auth"
+import { useEventStream } from "@/hooks/useEventStream"
 import { Sidebar } from "./Sidebar"
 import { Header } from "./Header"
 
 export function AppShell() {
   const { user, loading } = useAuthStore()
+  useEventStream()
 
   if (loading) {
     return (

@@ -4,6 +4,8 @@ import { FileAudio, Loader2, Pencil, Play, Trash2, Upload } from "lucide-react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
 import api from "@/api/client"
+import { useConfirm } from "@/components/ConfirmDialog"
+import { useDebouncedValue } from "@/hooks/useDebouncedValue"
 import { ProjectBadge } from "@/components/ProjectBadge"
 import type { AudioFile, Project, TranscriptionJob, TranscriptionModel, TranscriptionWorker } from "@/types"
 import { Badge } from "@/components/ui/badge"
@@ -66,12 +68,18 @@ function InputSourceBadge({ source }: { source?: string | null }) {
 
 export default function Files() {
   const qc = useQueryClient()
+  const confirm = useConfirm()
   const [selectedFile, setSelectedFile] = useState<AudioFile | null>(null)
   const [editingFile, setEditingFile] = useState<AudioFile | null>(null)
   const [editName, setEditName] = useState("")
   const [editNotes, setEditNotes] = useState("")
   const [editProjectId, setEditProjectId] = useState("none")
   const [projectFilter, setProjectFilter] = useState("all")
+  const [search, setSearch] = useState("")
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [bulkTranscribeOpen, setBulkTranscribeOpen] = useState(false)
+  const [bulkModelId, setBulkModelId] = useState("")
+  const [bulkLanguage, setBulkLanguage] = useState("auto")
   const [modelId, setModelId] = useState("")
   const [language, setLanguage] = useState("auto")
   const [splitEnabled, setSplitEnabled] = useState(false)
@@ -86,14 +94,19 @@ export default function Files() {
 
   const projectParams =
     projectFilter === "all" ? undefined : { project_id: projectFilter }
-  const { data: files = [], isLoading } = useQuery<AudioFile[]>({
-    queryKey: ["files", projectFilter],
-    queryFn: () => api.get("/files", { params: projectParams }).then((r) => r.data),
+  const debouncedSearch = useDebouncedValue(search.trim(), 300)
+  const fileListParams = {
+    ...(projectFilter === "all" ? {} : { project_id: projectFilter }),
+    ...(debouncedSearch ? { q: debouncedSearch } : {}),
+  }
+  const { data: files = [], isLoading, isError: filesError, refetch: refetchFiles } = useQuery<AudioFile[]>({
+    queryKey: ["files", projectFilter, debouncedSearch],
+    queryFn: () => api.get("/files", { params: fileListParams }).then((r) => r.data),
   })
   const { data: jobs = [] } = useQuery<TranscriptionJob[]>({
     queryKey: ["transcriptions", projectFilter],
     queryFn: () => api.get("/transcriptions", { params: projectParams }).then((r) => r.data),
-    refetchInterval: 5000,
+    refetchInterval: 20000,
   })
   const { data: projects = [], isLoading: projectsLoading } = useQuery<Project[]>({
     queryKey: ["projects"],
@@ -185,6 +198,71 @@ export default function Files() {
     },
     onError: (err: any) => toast.error(err.response?.data?.detail || "Delete failed"),
   })
+
+  const confirmDeleteFile = async (file: AudioFile) => {
+    const ok = await confirm({
+      title: "Delete audio file?",
+      description: `"${file.display_name || file.original_filename}" and its transcriptions will be permanently deleted.`,
+      confirmLabel: "Delete",
+      destructive: true,
+    })
+    if (ok) deleteMutation.mutate(file.id)
+  }
+
+  const toggleSelected = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  const allVisibleSelected = files.length > 0 && files.every((file) => selectedIds.has(file.id))
+  const toggleSelectAll = () => {
+    setSelectedIds((prev) => {
+      if (files.every((file) => prev.has(file.id))) return new Set()
+      return new Set(files.map((file) => file.id))
+    })
+  }
+  const clearSelection = () => setSelectedIds(new Set())
+
+  const bulkDeleteMutation = useMutation({
+    mutationFn: (ids: number[]) => api.post("/files/bulk-delete", { ids }).then((r) => r.data),
+    onSuccess: (data: { deleted: number; skipped: number[] }) => {
+      qc.invalidateQueries({ queryKey: ["files"] })
+      qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      clearSelection()
+      toast.success(`Deleted ${data.deleted} file${data.deleted === 1 ? "" : "s"}`)
+      if (data.skipped?.length) {
+        toast.warning(`${data.skipped.length} skipped (transcription running)`)
+      }
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Bulk delete failed"),
+  })
+
+  const bulkTranscribeMutation = useMutation({
+    mutationFn: (payload: { ids: number[]; model_id: number; language: string }) =>
+      api.post("/files/bulk-transcribe", payload).then((r) => r.data),
+    onSuccess: (data: { created: number }) => {
+      qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      qc.invalidateQueries({ queryKey: ["files"] })
+      clearSelection()
+      setBulkTranscribeOpen(false)
+      toast.success(`Queued ${data.created} transcription${data.created === 1 ? "" : "s"}`)
+    },
+    onError: (err: any) => toast.error(err.response?.data?.detail || "Bulk transcribe failed"),
+  })
+
+  const confirmBulkDelete = async () => {
+    const ids = Array.from(selectedIds)
+    const ok = await confirm({
+      title: `Delete ${ids.length} file${ids.length === 1 ? "" : "s"}?`,
+      description: "Selected audio files and their transcriptions will be permanently deleted.",
+      confirmLabel: "Delete",
+      destructive: true,
+    })
+    if (ok) bulkDeleteMutation.mutate(ids)
+  }
 
   const updateMutation = useMutation({
     mutationFn: () =>
@@ -316,6 +394,12 @@ export default function Files() {
           <p className="text-muted-foreground">Upload iPhone recordings and other audio files.</p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by file name…"
+            className="w-full sm:w-56"
+          />
           <Select value={projectFilter} onValueChange={setProjectFilter}>
             <SelectTrigger className="w-full sm:w-48">
               <SelectValue />
@@ -346,6 +430,33 @@ export default function Files() {
           </Label>
         </div>
       </div>
+
+      {selectedIds.size > 0 && (
+        <div className="flex flex-col gap-3 rounded-lg border bg-muted/40 p-3 sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-sm font-medium">{selectedIds.size} selected</span>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              disabled={installedModels.length === 0}
+              onClick={() => setBulkTranscribeOpen(true)}
+            >
+              <Play className="mr-2 h-3 w-3" /> Transcribe selected
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="border-destructive/40 text-destructive hover:bg-destructive/10"
+              disabled={bulkDeleteMutation.isPending}
+              onClick={confirmBulkDelete}
+            >
+              <Trash2 className="mr-2 h-3 w-3" /> Delete selected
+            </Button>
+            <Button size="sm" variant="ghost" onClick={clearSelection}>
+              Clear
+            </Button>
+          </div>
+        </div>
+      )}
 
       {uploadProgress && (
         <Card>
@@ -397,7 +508,16 @@ export default function Files() {
         </Card>
       )}
 
-      {isLoading ? (
+      {filesError ? (
+        <Card>
+          <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
+            <p className="text-sm text-muted-foreground">Could not load audio files.</p>
+            <Button variant="outline" size="sm" onClick={() => refetchFiles()}>
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      ) : isLoading ? (
         <div className="flex justify-center py-12">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
@@ -414,6 +534,15 @@ export default function Files() {
             <table className="w-full text-sm">
               <thead className="bg-muted/50">
                 <tr>
+                  <th className="w-10 p-3 text-left font-medium">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 cursor-pointer"
+                      checked={allVisibleSelected}
+                      onChange={toggleSelectAll}
+                      aria-label="Select all files"
+                    />
+                  </th>
                   <th className="p-3 text-left font-medium">File</th>
                   <th className="p-3 text-left font-medium">Preview</th>
                   <th className="p-3 text-left font-medium">Duration</th>
@@ -424,7 +553,16 @@ export default function Files() {
               </thead>
               <tbody className="divide-y">
                 {files.map((file) => (
-                  <tr key={file.id}>
+                  <tr key={file.id} className={selectedIds.has(file.id) ? "bg-muted/30" : ""}>
+                    <td className="p-3 align-top">
+                      <input
+                        type="checkbox"
+                        className="mt-1 h-4 w-4 cursor-pointer"
+                        checked={selectedIds.has(file.id)}
+                        onChange={() => toggleSelected(file.id)}
+                        aria-label={`Select ${file.display_name || file.original_filename}`}
+                      />
+                    </td>
                     <td className="max-w-[360px] p-3">
                       <p className="truncate font-medium">{file.display_name || file.original_filename}</p>
                       <p className="truncate text-xs text-muted-foreground">{file.original_filename}</p>
@@ -451,7 +589,7 @@ export default function Files() {
                         <Button size="sm" variant="outline" onClick={() => openEditDialog(file)}>
                           <Pencil className="h-3 w-3" />
                         </Button>
-                        <Button size="sm" variant="outline" onClick={() => deleteMutation.mutate(file.id)}>
+                        <Button size="sm" variant="outline" onClick={() => confirmDeleteFile(file)}>
                           <Trash2 className="h-3 w-3" />
                         </Button>
                       </div>
@@ -464,10 +602,21 @@ export default function Files() {
 
           <div className="space-y-3 md:hidden">
             {files.map((file) => (
-              <Card key={file.id}>
+              <Card key={file.id} className={selectedIds.has(file.id) ? "border-primary" : ""}>
                 <CardHeader className="pb-3">
-                  <CardTitle className="truncate text-base">{file.display_name || file.original_filename}</CardTitle>
-                  <p className="truncate text-xs text-muted-foreground">{file.original_filename}</p>
+                  <div className="flex items-start gap-2">
+                    <input
+                      type="checkbox"
+                      className="mt-1 h-4 w-4 cursor-pointer"
+                      checked={selectedIds.has(file.id)}
+                      onChange={() => toggleSelected(file.id)}
+                      aria-label={`Select ${file.display_name || file.original_filename}`}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <CardTitle className="truncate text-base">{file.display_name || file.original_filename}</CardTitle>
+                      <p className="truncate text-xs text-muted-foreground">{file.original_filename}</p>
+                    </div>
+                  </div>
                 </CardHeader>
                 <CardContent className="space-y-3">
                   {file.notes && <p className="text-sm text-muted-foreground">{file.notes}</p>}
@@ -487,7 +636,7 @@ export default function Files() {
                     <Button variant="outline" size="icon" onClick={() => openEditDialog(file)}>
                       <Pencil className="h-4 w-4" />
                     </Button>
-                    <Button variant="outline" size="icon" onClick={() => deleteMutation.mutate(file.id)}>
+                    <Button variant="outline" size="icon" onClick={() => confirmDeleteFile(file)}>
                       <Trash2 className="h-4 w-4" />
                     </Button>
                   </div>
@@ -679,6 +828,64 @@ export default function Files() {
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={bulkTranscribeOpen} onOpenChange={setBulkTranscribeOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Transcribe {selectedIds.size} file{selectedIds.size === 1 ? "" : "s"}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label>Model</Label>
+              <Select value={bulkModelId} onValueChange={setBulkModelId}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose installed model" />
+                </SelectTrigger>
+                <SelectContent>
+                  {installedModels.map((model) => (
+                    <SelectItem key={model.id} value={String(model.id)}>
+                      {model.display_name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Language</Label>
+              <Select value={bulkLanguage} onValueChange={setBulkLanguage}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {LANGUAGES.map((item) => (
+                    <SelectItem key={item.value} value={item.value}>
+                      {item.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Each selected file is queued as a normal single-worker job using the default worker.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              disabled={!bulkModelId || bulkTranscribeMutation.isPending}
+              onClick={() =>
+                bulkTranscribeMutation.mutate({
+                  ids: Array.from(selectedIds),
+                  model_id: Number(bulkModelId),
+                  language: bulkLanguage,
+                })
+              }
+            >
+              {bulkTranscribeMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Queue {selectedIds.size} job{selectedIds.size === 1 ? "" : "s"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

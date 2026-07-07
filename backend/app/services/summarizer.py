@@ -16,6 +16,7 @@ from app.schemas.summarization_settings import (
     SummarizationPullStatus,
     SummarizationSettings,
 )
+from app.services.event_bus import emit_summary_event
 from app.services.summarization_settings import get_summarization_settings
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,7 @@ async def queue_summary_if_enabled(job_id: int) -> None:
                 job.summary_finished_at = now
                 job.summary_updated_at = now
                 await db.commit()
+                emit_summary_event(job.owner_user_id, job_id)
                 await _notify_telegram_summary_finished(job_id)
             return
         if job.summary_status not in {"queued", "running"}:
@@ -170,6 +172,7 @@ async def queue_summary_if_enabled(job_id: int) -> None:
             job.summary_finished_at = None
             job.summary_updated_at = now
             await db.commit()
+            emit_summary_event(job.owner_user_id, job_id)
     if not config.enabled or not requested or not config.selected_model:
         return
     queue_summary_job(job_id)
@@ -215,6 +218,7 @@ async def mark_summary_cancelled(job_id: int) -> None:
         job.summary_finished_at = now
         job.summary_updated_at = now
         await db.commit()
+        emit_summary_event(job.owner_user_id, job_id)
     await _notify_telegram_summary_finished(job_id)
 
 
@@ -347,6 +351,7 @@ async def summarize_job(job_id: int) -> None:
         job.summary_finished_at = None
         job.summary_updated_at = now
         await db.commit()
+        emit_summary_event(job.owner_user_id, job_id)
         transcript_text = job.transcript_text
 
     try:
@@ -366,6 +371,7 @@ async def summarize_job(job_id: int) -> None:
                 job.summary_finished_at = now
                 job.summary_updated_at = now
                 await db.commit()
+                emit_summary_event(job.owner_user_id, job_id)
         await _notify_telegram_summary_finished(job_id)
         return
 
@@ -383,6 +389,7 @@ async def summarize_job(job_id: int) -> None:
             job.summary_finished_at = now
             job.summary_updated_at = now
             await db.commit()
+            emit_summary_event(job.owner_user_id, job_id)
     await _notify_telegram_summary_finished(job_id)
 
 

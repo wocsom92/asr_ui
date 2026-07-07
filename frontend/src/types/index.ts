@@ -222,6 +222,18 @@ export interface TranscriptionJob {
   model: TranscriptionModel | null
 }
 
+export interface TranscriptionStats {
+  total: number
+  finished: number
+  active_transcriptions: number
+  active_summaries: number
+  failed_summaries: number
+  completed_summaries: number
+  transcript_storage_bytes: number
+  summary_word_count: number
+  average_summary_words: number
+}
+
 export interface TranscriptionJobChunk {
   id: number
   index: number

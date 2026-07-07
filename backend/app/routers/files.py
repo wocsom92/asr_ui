@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from pydantic import BaseModel
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,11 +25,24 @@ from app.models.user import User
 from app.schemas.files import AudioFileOut, AudioFileUpdate
 from app.schemas.transcription import TranscriptionCreate, TranscriptionJobOut
 from app.services.audio_svc import is_supported_audio, probe_duration_seconds
+from app.services.event_bus import emit_job_event
 from app.services.transcriber import TranscriptionError, validate_transcription_runtime
 from app.services.transcription_files import delete_transcription_outputs
 from app.services.worker_runtime import create_split_chunks
 
 router = APIRouter(prefix="/api/v1/files", tags=["files"])
+
+
+class BulkFileIdsRequest(BaseModel):
+    ids: list[int] = []
+
+
+class BulkTranscribeRequest(BaseModel):
+    ids: list[int] = []
+    model_id: int
+    language: str = "auto"
+
+    model_config = {"protected_namespaces": ()}
 
 
 def _iter_file_range(path: Path, start: int, end: int):
@@ -68,21 +84,92 @@ def _apply_project_filter(query, project_id: str | None):
     return query.where(AudioFile.project_id == parsed_project_id)
 
 
+def _parse_filter_date(value: str | None, *, end_of_day: bool = False) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        if len(text) == 10:
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+            if end_of_day:
+                parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid date filter (use YYYY-MM-DD)") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _build_file_filters(
+    *,
+    project_id: str | None,
+    q: str | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> list:
+    conditions: list = []
+    if project_id is not None:
+        if project_id == "none":
+            conditions.append(AudioFile.project_id.is_(None))
+        else:
+            try:
+                conditions.append(AudioFile.project_id == int(project_id))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid project filter") from exc
+    if q:
+        like = f"%{q.strip().lower()}%"
+        conditions.append(
+            or_(
+                func.lower(AudioFile.original_filename).like(like),
+                func.lower(func.coalesce(AudioFile.display_name, "")).like(like),
+            )
+        )
+    df = _parse_filter_date(date_from)
+    if df is not None:
+        conditions.append(AudioFile.created_at >= df)
+    dt = _parse_filter_date(date_to, end_of_day=True)
+    if dt is not None:
+        conditions.append(AudioFile.created_at <= dt)
+    return conditions
+
+
 @router.get("", response_model=list[AudioFileOut])
 async def list_files(
+    response: Response,
     project_id: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    conditions = _build_file_filters(
+        project_id=project_id, q=q, date_from=date_from, date_to=date_to
+    )
+
+    count_query = select(func.count()).select_from(AudioFile).where(
+        AudioFile.owner_user_id == user.id
+    )
+    for condition in conditions:
+        count_query = count_query.where(condition)
+    total = (await db.execute(count_query)).scalar() or 0
+    response.headers["X-Total-Count"] = str(total)
+
     query = (
         select(AudioFile)
         .options(selectinload(AudioFile.project))
         .where(AudioFile.owner_user_id == user.id)
     )
-    query = _apply_project_filter(query, project_id)
-    result = await db.execute(
-        query.order_by(AudioFile.created_at.desc(), AudioFile.id.desc())
-    )
+    for condition in conditions:
+        query = query.where(condition)
+    query = query.order_by(AudioFile.created_at.desc(), AudioFile.id.desc())
+    if limit is not None:
+        query = query.limit(limit).offset(offset)
+    result = await db.execute(query)
     return result.scalars().all()
 
 
@@ -249,13 +336,114 @@ async def delete_file(
             detail="Cannot delete an audio file while transcription is running",
         )
 
-    for job in audio.transcription_jobs:
-        delete_transcription_outputs(job)
+    def _remove_files() -> None:
+        for job in audio.transcription_jobs:
+            delete_transcription_outputs(job)
+        Path(audio.stored_path).unlink(missing_ok=True)
 
-    Path(audio.stored_path).unlink(missing_ok=True)
+    await asyncio.to_thread(_remove_files)
     await db.delete(audio)
     await db.commit()
     return {"message": "Deleted"}
+
+
+@router.post("/bulk-delete")
+async def bulk_delete_files(
+    body: BulkFileIdsRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        return {"deleted": 0, "skipped": []}
+    result = await db.execute(
+        select(AudioFile)
+        .options(selectinload(AudioFile.transcription_jobs))
+        .where(AudioFile.id.in_(ids), AudioFile.owner_user_id == user.id)
+    )
+    files = result.scalars().all()
+    deleted = 0
+    skipped: list[int] = []
+    for audio in files:
+        if any(job.status == "running" for job in audio.transcription_jobs):
+            skipped.append(audio.id)
+            continue
+
+        def _remove_files(target: AudioFile = audio) -> None:
+            for job in target.transcription_jobs:
+                delete_transcription_outputs(job)
+            Path(target.stored_path).unlink(missing_ok=True)
+
+        await asyncio.to_thread(_remove_files)
+        await db.delete(audio)
+        deleted += 1
+    await db.commit()
+    emit_job_event(user.id)
+    return {"deleted": deleted, "skipped": skipped}
+
+
+@router.post("/bulk-transcribe")
+async def bulk_transcribe_files(
+    body: BulkTranscribeRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        return {"created": 0}
+
+    model_result = await db.execute(
+        select(TranscriptionModel).where(
+            TranscriptionModel.id == body.model_id,
+            TranscriptionModel.status == "installed",
+        )
+    )
+    model = model_result.scalar_one_or_none()
+    if not model:
+        raise HTTPException(status_code=404, detail="Installed model not found")
+    if model.provider != "gigaam":
+        try:
+            validate_transcription_runtime()
+        except TranscriptionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    language = body.language
+    if model.language_mode == "english":
+        language = "en"
+    elif model.language_mode == "russian":
+        language = "ru"
+
+    default_worker = await db.execute(
+        select(TranscriptionWorker).where(
+            TranscriptionWorker.name == "raspi5",
+            TranscriptionWorker.accepted.is_(True),
+            TranscriptionWorker.is_deleted.is_not(True),
+        )
+    )
+    preferred_worker = default_worker.scalar_one_or_none()
+
+    files_result = await db.execute(
+        select(AudioFile).where(AudioFile.id.in_(ids), AudioFile.owner_user_id == user.id)
+    )
+    files = files_result.scalars().all()
+    created = 0
+    for audio in files:
+        job = TranscriptionJob(
+            owner_user_id=user.id,
+            audio_file_id=audio.id,
+            model_id=model.id,
+            language=language,
+            status="queued",
+            status_text="Waiting for worker",
+            preferred_worker_id=preferred_worker.id if preferred_worker else None,
+            preferred_worker_name_snapshot=preferred_worker.name if preferred_worker else None,
+            split_enabled=False,
+        )
+        db.add(job)
+        created += 1
+    await db.commit()
+    emit_job_event(user.id)
+    return {"created": created}
 
 
 @router.post("/{file_id}/transcriptions", response_model=TranscriptionJobOut)
@@ -375,4 +563,6 @@ async def create_transcription(
         )
         .where(TranscriptionJob.id == job.id)
     )
-    return result.scalar_one()
+    created = result.scalar_one()
+    emit_job_event(user.id, created.id)
+    return created

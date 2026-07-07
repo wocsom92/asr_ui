@@ -15,7 +15,10 @@ from app.models.transcription_job import TranscriptionJob
 from app.models.transcription_job_chunk import TranscriptionJobChunk
 from app.models.transcription_model import TranscriptionModel
 from app.models.transcription_worker import TranscriptionWorker
+from app.services.diarization import assign_speakers, diarize, is_diarization_enabled
+from app.services.event_bus import emit_job_event, emit_worker_event
 from app.services.job_cancellation import dispose_job_cancel_event, prepare_job_cancel_event
+from app.services.segment_outputs import write_segment_outputs
 from app.services.model_catalog import get_catalog_item, model_storage_path
 from app.services.model_installer import install_model
 from app.services.telegram_bot import notify_transcription_finished
@@ -253,6 +256,7 @@ async def _record_worker_finished(
             add_worker_model_speed_sample(worker, model_variant, runtime_seconds, audio_seconds)
         worker.updated_at = datetime.now(timezone.utc)
         await db.commit()
+    emit_worker_event()
 
 
 async def _process_claimed_install(variant: str, worker_name: str) -> None:
@@ -357,6 +361,34 @@ async def _record_local_worker_error(worker_name: str, error: str) -> None:
             await db.commit()
 
 
+async def _apply_diarization(job: TranscriptionJob) -> None:
+    """Best-effort: label finished segments with speakers and rewrite outputs.
+
+    No-op unless diarization is enabled and the audio + JSON segments are available.
+    Any failure is logged and ignored so it never fails the transcription.
+    """
+    if not is_diarization_enabled():
+        return
+    try:
+        json_path = getattr(job, "output_json_path", None)
+        audio = job.audio_file
+        if not json_path or not Path(json_path).exists() or not audio:
+            return
+        data = await asyncio.to_thread(
+            lambda: json.loads(Path(json_path).read_text(encoding="utf-8", errors="replace"))
+        )
+        canonical = data.get("transcription") if isinstance(data, dict) else None
+        if not isinstance(canonical, list) or not canonical:
+            return
+        turns = await diarize(Path(audio.stored_path))
+        if not turns:
+            return
+        labelled = assign_speakers(canonical, turns)
+        await asyncio.to_thread(write_segment_outputs, job, labelled)
+    except Exception:
+        logger.exception("Diarization step failed for job %s", job.id)
+
+
 async def _process_claimed_job(job_id: int, worker_name: str) -> None:
     async with async_session_factory() as db:
         cancel_event = await prepare_job_cancel_event(job_id)
@@ -448,6 +480,7 @@ async def _process_claimed_job(job_id: int, worker_name: str) -> None:
                 job.status = "succeeded"
                 job.status_text = "Transcription finished"
                 job.error_message = None
+                await _apply_diarization(job)
             except TranscriptionCancelled:
                 job.status = "cancelled"
                 job.status_text = "Cancelled"
@@ -467,6 +500,7 @@ async def _process_claimed_job(job_id: int, worker_name: str) -> None:
             finally:
                 job.finished_at = datetime.now(timezone.utc)
                 await db.commit()
+                emit_job_event(job.owner_user_id, job.id)
                 if job.status == "succeeded":
                     await queue_summary_if_enabled(job.id)
                 await notify_transcription_finished(job)
@@ -555,4 +589,5 @@ async def _process_claimed_chunk(chunk_id: int, worker_name: str) -> None:
                 job.model.variant if job.model else None,
             )
             await try_merge_split_job(db, job.id)
+            emit_job_event(job.owner_user_id, job.id)
             await dispose_job_cancel_event(job.id)

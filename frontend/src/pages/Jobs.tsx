@@ -5,6 +5,7 @@ import { Link } from "react-router-dom"
 import { toast } from "sonner"
 
 import api from "@/api/client"
+import { useConfirm } from "@/components/ConfirmDialog"
 import { PaginationControls } from "@/components/PaginationControls"
 import { TranscriptAudioPlayer } from "@/components/TranscriptAudioPlayer"
 import { Badge } from "@/components/ui/badge"
@@ -214,12 +215,16 @@ function SplitProcessedProgress({ job }: { job: TranscriptionJob }) {
 
 export default function Jobs() {
   const qc = useQueryClient()
+  const confirm = useConfirm()
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState("all")
   const [page, setPage] = useState(1)
-  const { data: jobs = [], isLoading } = useQuery<TranscriptionJob[]>({
+  const { data: jobs = [], isLoading, isError, refetch } = useQuery<TranscriptionJob[]>({
     queryKey: ["transcriptions"],
     queryFn: () => api.get("/transcriptions").then((r) => r.data),
+    // SSE pushes status/completion changes; a short poll only stays on while a job is
+    // actively running so the progress bar / partial transcript stay live (progress is
+    // not pushed). Otherwise fall back to a slow safety poll.
     refetchInterval: (query) => {
       const list = query.state.data
       return list?.some(
@@ -230,9 +235,18 @@ export default function Jobs() {
           j.summary_status === "queued" ||
           j.summary_status === "running"
       )
-        ? 1500
-        : 5000
+        ? 2000
+        : 20000
     },
+  })
+
+  const expandedJobId = expandedId ? Number(expandedId.replace(/^(transcription|summary)-/, "")) : null
+  // The list omits large transcript/summary text; load the full record for the open row.
+  const { data: expandedDetail } = useQuery<TranscriptionJob>({
+    queryKey: ["transcriptions", "detail", expandedJobId],
+    queryFn: () => api.get(`/transcriptions/${expandedJobId}`).then((r) => r.data),
+    enabled: expandedJobId !== null && !Number.isNaN(expandedJobId),
+    refetchInterval: 30000,
   })
 
   const cancelMutation = useMutation({
@@ -275,6 +289,7 @@ export default function Jobs() {
         prev ? prev.map((j) => (j.id === job.id ? job : j)) : prev
       )
       void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      void qc.invalidateQueries({ queryKey: ["transcriptions", "detail"] })
       toast.success("Summary queued")
     },
     onError: (err: unknown) => {
@@ -291,6 +306,7 @@ export default function Jobs() {
         prev ? prev.map((j) => (j.id === job.id ? job : j)) : prev
       )
       void qc.invalidateQueries({ queryKey: ["transcriptions"] })
+      void qc.invalidateQueries({ queryKey: ["transcriptions", "detail"] })
       toast.success("Summary cancelled")
     },
     onError: (err: unknown) => {
@@ -360,7 +376,16 @@ export default function Jobs() {
         </Select>
       </div>
 
-      {isLoading ? (
+      {isError ? (
+        <Card>
+          <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
+            <p className="text-sm text-muted-foreground">Could not load jobs.</p>
+            <Button variant="outline" size="sm" onClick={() => refetch()}>
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      ) : isLoading ? (
         <div className="flex justify-center py-12">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
@@ -385,8 +410,11 @@ export default function Jobs() {
 
           {pagedItems.map((item) => {
             if (item.kind === "summary") {
-              const job = item.job
               const expanded = expandedId === item.id
+              const job =
+                expanded && expandedDetail && expandedDetail.id === item.job.id
+                  ? { ...item.job, ...expandedDetail }
+                  : item.job
               return (
                 <Card key={item.id} className={expanded ? "border-primary" : ""}>
                   <button
@@ -521,8 +549,11 @@ export default function Jobs() {
               )
             }
 
-            const job = item.job
             const expanded = expandedId === item.id
+            const job =
+              expanded && expandedDetail && expandedDetail.id === item.job.id
+                ? { ...item.job, ...expandedDetail }
+                : item.job
             const progress = jobProgress(job)
             const eta = jobEta(job, jobs)
             const runningWorkers = job.running_worker_names ?? []
@@ -802,10 +833,14 @@ export default function Jobs() {
                           variant="outline"
                           className="w-full border-destructive/40 text-destructive hover:bg-destructive/10 sm:w-auto"
                           disabled={deleteMutation.isPending}
-                          onClick={() => {
-                            if (window.confirm("Delete this transcription and all generated output files?")) {
-                              deleteMutation.mutate(job.id)
-                            }
+                          onClick={async () => {
+                            const ok = await confirm({
+                              title: "Delete transcription?",
+                              description: "This transcription and all generated output files will be permanently deleted.",
+                              confirmLabel: "Delete",
+                              destructive: true,
+                            })
+                            if (ok) deleteMutation.mutate(job.id)
                           }}
                         >
                           <Trash2 className="mr-2 h-4 w-4" />

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse, PlainTextResponse
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from app.auth.deps import get_current_user
 from app.database import get_db
@@ -17,8 +18,24 @@ from app.models.audio_file import AudioFile
 from app.models.transcription_job import TranscriptionJob
 from app.models.user import User
 from app.models.transcription_worker import TranscriptionWorker
-from app.schemas.transcription import TranscriptionJobOut, TranscriptionSegmentOut
+from app.config import settings
+from app.schemas.transcription import (
+    BulkIdsRequest,
+    SegmentEdit,
+    SegmentsUpdate,
+    TranscriptionJobListOut,
+    TranscriptionJobOut,
+    TranscriptionSegmentOut,
+    TranscriptionStatsOut,
+)
+
+# Large TEXT columns that the list view never renders inline; the detail endpoint
+# (`GET /transcriptions/{id}`) still returns them in full. Deferring them keeps the
+# frequently polled list query and payload small.
+_LIST_DEFERRED_FIELDS = ("transcript_text", "summary_text", "partial_transcript_json")
+from app.services.event_bus import emit_job_event
 from app.services.job_cancellation import signal_job_cancel
+from app.services.segment_outputs import write_segment_outputs
 from app.services.summarization_settings import get_summarization_settings
 from app.services.summarizer import cancel_summary_job, queue_summary_job
 from app.services.transcription_files import delete_transcription_outputs
@@ -81,7 +98,11 @@ def _segments_from_data(data: Any) -> list[TranscriptionSegmentOut]:
         end = _segment_seconds(raw, "end")
         if not text or start is None or end is None:
             continue
-        segments.append(TranscriptionSegmentOut(start=start, end=max(start, end), text=text))
+        speaker = raw.get("speaker")
+        speaker = str(speaker).strip() if speaker not in (None, "") else None
+        segments.append(
+            TranscriptionSegmentOut(start=start, end=max(start, end), text=text, speaker=speaker)
+        )
     return segments
 
 
@@ -124,6 +145,27 @@ def _read_transcription_segments(
     return _read_partial_transcription_segments(job)
 
 
+def _regenerate_job_outputs(job: TranscriptionJob, edits: list[SegmentEdit]) -> None:
+    """Rewrite txt/json/srt/vtt outputs and transcript_text from edited segments."""
+    canonical: list[dict[str, Any]] = []
+    for edit in edits:
+        text = edit.text.strip()
+        if not text:
+            continue
+        start = max(0.0, float(edit.start))
+        end = max(start, float(edit.end))
+        item: dict[str, Any] = {
+            "offsets": {"from": int(round(start * 1000)), "to": int(round(end * 1000))},
+            "text": text,
+        }
+        speaker = (edit.speaker or "").strip()
+        if speaker:
+            item["speaker"] = speaker
+        canonical.append(item)
+
+    write_segment_outputs(job, canonical)
+
+
 def _job_query(user_id: int):
     return (
         select(TranscriptionJob)
@@ -148,6 +190,64 @@ def _apply_project_filter(query, project_id: str | None):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid project filter") from exc
     return query.where(AudioFile.project_id == parsed_project_id)
+
+
+def _parse_filter_date(value: str | None, *, end_of_day: bool = False) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        if len(text) == 10:  # YYYY-MM-DD
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+            if end_of_day:
+                parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid date filter (use YYYY-MM-DD)") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _build_transcription_filters(
+    *,
+    project_id: str | None,
+    q: str | None,
+    status: str | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[list, bool]:
+    """Return (where-conditions, whether an AudioFile join is required)."""
+    conditions: list = []
+    join_audio = False
+    if project_id is not None:
+        join_audio = True
+        if project_id == "none":
+            conditions.append(AudioFile.project_id.is_(None))
+        else:
+            try:
+                conditions.append(AudioFile.project_id == int(project_id))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid project filter") from exc
+    if q:
+        join_audio = True
+        like = f"%{q.strip().lower()}%"
+        conditions.append(
+            or_(
+                func.lower(AudioFile.original_filename).like(like),
+                func.lower(func.coalesce(AudioFile.display_name, "")).like(like),
+            )
+        )
+    if status:
+        conditions.append(TranscriptionJob.status == status)
+    df = _parse_filter_date(date_from)
+    if df is not None:
+        conditions.append(TranscriptionJob.created_at >= df)
+    dt = _parse_filter_date(date_to, end_of_day=True)
+    if dt is not None:
+        conditions.append(TranscriptionJob.created_at <= dt)
+    return conditions, join_audio
 
 
 async def _offline_worker_ids(db: AsyncSession, worker_ids: set[int]) -> set[int]:
@@ -229,20 +329,80 @@ async def _reconcile_offline_cancelling_jobs(db: AsyncSession, user_id: int) -> 
         await db.commit()
 
 
-@router.get("", response_model=list[TranscriptionJobOut])
+@router.get("", response_model=list[TranscriptionJobListOut])
 async def list_transcriptions(
+    response: Response,
     project_id: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     await _reconcile_offline_cancelling_jobs(db, user.id)
-    query = _apply_project_filter(_job_query(user.id), project_id)
-    result = await db.execute(
-        query.order_by(
-            TranscriptionJob.created_at.desc(), TranscriptionJob.id.desc()
-        )
+    conditions, join_audio = _build_transcription_filters(
+        project_id=project_id, q=q, status=status, date_from=date_from, date_to=date_to
     )
+
+    count_query = select(func.count(func.distinct(TranscriptionJob.id))).where(
+        TranscriptionJob.owner_user_id == user.id
+    )
+    if join_audio:
+        count_query = count_query.join(TranscriptionJob.audio_file)
+    for condition in conditions:
+        count_query = count_query.where(condition)
+    total = (await db.execute(count_query)).scalar() or 0
+    response.headers["X-Total-Count"] = str(total)
+
+    query = _job_query(user.id)
+    if join_audio:
+        query = query.join(TranscriptionJob.audio_file)
+    for condition in conditions:
+        query = query.where(condition)
+    query = query.options(*(defer(getattr(TranscriptionJob, field)) for field in _LIST_DEFERRED_FIELDS))
+    query = query.order_by(TranscriptionJob.created_at.desc(), TranscriptionJob.id.desc())
+    if limit is not None:
+        query = query.limit(limit).offset(offset)
+    result = await db.execute(query)
     return result.scalars().all()
+
+
+@router.get("/stats", response_model=TranscriptionStatsOut)
+async def transcription_stats(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(TranscriptionJob).where(TranscriptionJob.owner_user_id == user.id)
+    )
+    jobs = result.scalars().all()
+
+    stats = TranscriptionStatsOut(total=len(jobs))
+    for job in jobs:
+        if job.status == "succeeded":
+            stats.finished += 1
+            stats.transcript_storage_bytes += (
+                (job.output_txt_size_bytes or 0)
+                + (job.output_json_size_bytes or 0)
+                + (job.output_srt_size_bytes or 0)
+                + (job.output_vtt_size_bytes or 0)
+            )
+        if job.status in {"queued", "running"}:
+            stats.active_transcriptions += 1
+        if job.summary_status in {"queued", "running"}:
+            stats.active_summaries += 1
+        elif job.summary_status == "failed":
+            stats.failed_summaries += 1
+        elif job.summary_status == "succeeded" and job.summary_text:
+            stats.completed_summaries += 1
+            stats.summary_word_count += len([word for word in job.summary_text.split() if word])
+
+    if stats.completed_summaries:
+        stats.average_summary_words = round(stats.summary_word_count / stats.completed_summaries)
+    return stats
 
 
 @router.get("/{job_id}", response_model=TranscriptionJobOut)
@@ -359,6 +519,7 @@ async def cancel_transcription(
         )
         .where(TranscriptionJob.id == job_id, TranscriptionJob.owner_user_id == user.id)
     )
+    emit_job_event(user.id, job_id)
     return refreshed.scalar_one()
 
 
@@ -391,6 +552,7 @@ async def summarize_transcription(
     job.summary_updated_at = now
     await db.commit()
     queue_summary_job(job.id)
+    emit_job_event(user.id, job_id)
 
     refreshed = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
     return refreshed.scalar_one()
@@ -416,6 +578,7 @@ async def cancel_transcription_summary(
     job.summary_finished_at = now
     job.summary_updated_at = now
     await db.commit()
+    emit_job_event(user.id, job_id)
 
     refreshed = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
     return refreshed.scalar_one()
@@ -437,11 +600,39 @@ async def delete_transcription(
             detail="Cancel the running transcription before deleting it.",
         )
 
-    delete_transcription_outputs(job)
+    await asyncio.to_thread(delete_transcription_outputs, job)
 
     await db.delete(job)
     await db.commit()
+    emit_job_event(user.id, job_id)
     return {"message": "Deleted"}
+
+
+@router.post("/bulk-delete")
+async def bulk_delete_transcriptions(
+    body: BulkIdsRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        return {"deleted": 0, "skipped": []}
+    result = await db.execute(
+        _job_query(user.id).where(TranscriptionJob.id.in_(ids))
+    )
+    jobs = result.scalars().all()
+    deleted = 0
+    skipped: list[int] = []
+    for job in jobs:
+        if job.status == "running":
+            skipped.append(job.id)
+            continue
+        await asyncio.to_thread(delete_transcription_outputs, job)
+        await db.delete(job)
+        deleted += 1
+    await db.commit()
+    emit_job_event(user.id)
+    return {"deleted": deleted, "skipped": skipped}
 
 
 @router.get("/{job_id}/segments", response_model=list[TranscriptionSegmentOut])
@@ -458,6 +649,35 @@ async def get_transcription_segments(
     if source == "final" and job.status != "succeeded":
         raise HTTPException(status_code=409, detail="Transcription is not finished")
     return _read_transcription_segments(job, source)
+
+
+@router.patch("/{job_id}/segments", response_model=list[TranscriptionSegmentOut])
+async def update_transcription_segments(
+    job_id: int,
+    body: SegmentsUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    if job.status != "succeeded":
+        raise HTTPException(status_code=409, detail="Only finished transcriptions can be edited")
+    if not body.segments:
+        raise HTTPException(status_code=400, detail="At least one segment is required")
+
+    await asyncio.to_thread(_regenerate_job_outputs, job, body.segments)
+    # Summary no longer matches the edited transcript; mark it stale so the user re-runs it.
+    if job.summary_status == "succeeded":
+        job.summary_status = "idle"
+        job.summary_updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    emit_job_event(user.id, job_id)
+
+    refreshed = await db.execute(_job_query(user.id).where(TranscriptionJob.id == job_id))
+    refreshed_job = refreshed.scalar_one()
+    return _read_transcription_segments(refreshed_job, "final")
 
 
 @router.get("/{job_id}/download")
